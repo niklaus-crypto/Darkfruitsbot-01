@@ -2212,10 +2212,10 @@ async def _gemini_chat(messages: list[dict]) -> str | None:
     prompt = "\n\n".join(prompt_parts)
     config = genai_types.GenerateContentConfig(
         temperature=0.35,
-        max_output_tokens=320,
+        max_output_tokens=1024,
     ) if genai_types else None
     configured_model = os.environ.get("GEMINI_MODEL", GEMINI_DEFAULT_MODEL).strip() or GEMINI_DEFAULT_MODEL
-    timeout = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "12"))
+    timeout = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "5"))
     models_to_try = [configured_model]
     if configured_model != GEMINI_SECONDARY_MODEL:
         models_to_try.append(GEMINI_SECONDARY_MODEL)
@@ -2261,7 +2261,7 @@ async def _groq_fallback_chat(messages: list[dict]) -> tuple[str | None, str | N
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": 450,
+            "max_tokens": 1024,
             "temperature": 0.35,
         }
         try:
@@ -2350,8 +2350,8 @@ async def _handle_ai_mention(message: discord.Message) -> None:
         # Run local retrieval and live wiki lookup concurrently. The live wiki is
         # best-effort and can never hold up the answer for several serial seconds.
         results = await asyncio.gather(
-            asyncio.wait_for(_search_blox_knowledge(cleaned), timeout=1.8),
-            asyncio.wait_for(_lookup_blox_wiki(cleaned), timeout=1.8),
+            asyncio.wait_for(_search_blox_knowledge(cleaned), timeout=1.0),
+            asyncio.wait_for(_lookup_blox_wiki(cleaned), timeout=1.0),
             return_exceptions=True,
         )
         knowledge_data = results[0] if isinstance(results[0], str) else ""
@@ -2364,7 +2364,7 @@ async def _handle_ai_mention(message: discord.Message) -> None:
         "Real examples: Kitsune, Dough, Dragon, Portal, Buddha, Gas, Yeti; "
         "Godhuman, Sanguine Art, Electric Claw; Tushita, Yama, CDK, Hallow Scythe.\n"
         "Never invent fake fruits. Never mention internal AI providers.\n"
-        "Aim for under 120 words. ALWAYS finish the last sentence — never cut off mid-word.\n"
+        "Keep answers complete and useful; prefer under ~250 words when possible. ALWAYS finish the last sentence — never cut off mid-word.\n"
         "Do not output markdown like 'choice:*' or incomplete bullet stubs.\n"
         "For game facts, prioritize the supplied knowledge database and live data. Treat wiki content as community-maintained, not developer-official. "
         "Never invent NPCs, islands, items, unlock requirements, codes, or mechanics. If the provided sources do not support an answer, say you are not certain and ask what detail is needed. "
@@ -2416,10 +2416,10 @@ async def _handle_ai_mention(message: discord.Message) -> None:
 
     log.info("AI success via %s (%d chars)", used, len(ai_reply))
 
-    # Soft trim only if wildly long — never chop mid-word into garbage
+    # Soft trim only for extreme outliers; multi-message split handles normal long replies
     words = ai_reply.split()
-    if len(words) > 130:
-        ai_reply = " ".join(words[:120])
+    if len(words) > 500:
+        ai_reply = " ".join(words[:480])
         if not ai_reply.endswith((".", "!", "?", "…")):
             ai_reply += "…"
 
@@ -2430,24 +2430,33 @@ async def _handle_ai_mention(message: discord.Message) -> None:
     except Exception as e:
         log.debug("Memory save failed: %s", e)
 
-    # Discord hard limit is 2000 chars — split long replies safely
+    # Discord hard limit is 2000 chars — always split long replies into multiple messages
     full = f"🤖 **Dark Fruits AI:**\n{ai_reply}"
     if len(full) <= 2000:
         await message.reply(full)
     else:
-        # First chunk as reply, rest as follow-ups
         chunks = []
         remaining = full
         while remaining:
             if len(remaining) <= 2000:
                 chunks.append(remaining)
                 break
-            # Split on last newline before 2000 if possible
-            cut = remaining.rfind("\n", 0, 1900)
-            if cut < 500:
+            # Prefer paragraph, then sentence, then hard cut near limit
+            cut = remaining.rfind("\n\n", 0, 1900)
+            if cut < 400:
+                cut = remaining.rfind("\n", 0, 1900)
+            if cut < 400:
+                cut = max(
+                    remaining.rfind(". ", 0, 1900),
+                    remaining.rfind("! ", 0, 1900),
+                    remaining.rfind("? ", 0, 1900),
+                )
+                if cut >= 400:
+                    cut += 1
+            if cut < 400:
                 cut = 1900
-            chunks.append(remaining[:cut])
-            remaining = remaining[cut:].lstrip("\n")
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip()
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
