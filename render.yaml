@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: dark-fruits-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    disk:
+      name: dark-fruits-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_TIMEOUT_SECONDS
+        value: "12"
+      - key: DB_PATH
+        value: /var/data/giveaways.db
+      - key: BLOXFRUITS_KNOWLEDGE_DB
+        value: /var/data/bloxfruits_knowledge.db
+      - key: KNOWLEDGE_MAX_PAGES
+        value: "2000"
+      - key: STAFF_ROLE_ID
+        value: "1492296310785835179"
+      - key: QUEST_CHANNEL_ID
+        value: "1555732644397064313"
+      - key: QUEST_PROOF_CHANNEL_ID
+        value: "1555733599402066040"
+      - key: STOCK_CHANNEL_ID
+        value: "1489744139930173550"
+      - key: STOCK_PING_ROLE_ID
+        value: "1495818903845343313"
+      - key: CODES_CHANNEL_ID
+        value: "1504914665589706762"
+      - key: MEDIA_ONLY_CHANNEL_ID
+        value: "1504931608170463312"
+      - key: ALLOWED_MEDIA_CHANNEL_ID
+        value: "1489744139930173550"
+      - key: MONTHLY_LEADERBOARD_CHANNEL_ID
+        value: "1555694574452736041"
+      - key: VOUCH_CHANNEL_ID
+        value: "1555694574452736041"
+      - key: SUGGESTION_REWARD_ROLE_ID
+        value: "0"
+      - key: TICKET_CATEGORY_ID
+        value: "0"
+      - key: TICKET_LOG_CHANNEL_ID
+        value: "0"
+      - key: MOD_LOG_CHANNEL_ID
+        value: "0"
+      - key: AUTOMOD_BLOCK_LINKS
+        value: "true"
+      - key: AUTOMOD_BLOCK_MEDIA_OUTSIDE_CHANNEL
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
