@@ -71,7 +71,7 @@ DARK_FRUITS_PURPLE = discord.Color.from_rgb(114, 53, 219)
 SERVER_NAME = "Dark Fruits"
 THUMBNAIL_URL = os.environ.get(
     "THUMBNAIL_URL",
-    "https://media1.tenor.com/m/gzUrqiF-rVMAAAAd/blox-fruits.gif",
+    "https://media.tenor.com/gzUrqiF-rVMAAAAd/blox-fruits.gif",
 )
 STAFF_ROLE_ID = int(os.environ.get("STAFF_ROLE_ID", "1492296310785835179"))
 QUEST_CHANNEL_ID = int(os.environ.get("QUEST_CHANNEL_ID", "1555732644397064313"))
@@ -2087,6 +2087,12 @@ async def on_message(message: discord.Message):
                     )
                 except Exception:
                     pass
+    else:
+        # Ticket-room AI: auto-reply to the opener while AI is not paused
+        try:
+            await _maybe_ticket_ai_reply(message)
+        except Exception:
+            log.debug("Ticket AI reply skipped", exc_info=True)
 
     # ── Sticky messages (cached) ────────────────────────────────────────────
     async with _cache_lock:
@@ -2312,6 +2318,84 @@ async def _groq_fallback_chat(messages: list[dict]) -> tuple[str | None, str | N
         except Exception as e:
             log.warning("Groq fallback model %s failed: %s: %s", model_name, type(e).__name__, e)
     return None, None
+
+
+
+_ticket_ai_cooldown: dict[int, float] = {}
+
+
+async def _maybe_ticket_ai_reply(message: discord.Message) -> None:
+    """Auto-answer the ticket opener in open ticket channels until staff claims/reminds."""
+    if not message.guild or not message.content or not message.content.strip():
+        return
+    if not isinstance(message.channel, discord.TextChannel):
+        return
+    # Fast path: channel name must look like a ticket
+    if not (message.channel.name.startswith("ticket-") or message.channel.name.startswith("closed-")):
+        return
+    try:
+        await _ticket_panel_schema()
+    except Exception:
+        return
+    meta = await db.fetchone(
+        "SELECT ticket_number, topic, ai_paused FROM df_ticket_meta WHERE channel_id = ?",
+        (message.channel.id,),
+    )
+    if not meta or int(meta["ai_paused"] or 0):
+        return
+    trow = await db.fetchone(
+        "SELECT opener_id, closed_at FROM df_tickets WHERE channel_id = ?",
+        (message.channel.id,),
+    )
+    if not trow or trow["closed_at"]:
+        return
+    # Only auto-reply to the opener (staff talking should not trigger AI)
+    if message.author.id != int(trow["opener_id"]):
+        return
+    # If they @mention the bot, the main AI path already handled it
+    if bot.user and bot.user in message.mentions:
+        return
+    import time as _time
+    now = _time.monotonic()
+    last = _ticket_ai_cooldown.get(message.channel.id, 0.0)
+    if now - last < 8.0:
+        return
+    _ticket_ai_cooldown[message.channel.id] = now
+
+    topic = meta["topic"] or "Support"
+    ticket_no = int(meta["ticket_number"] or 0)
+    system = (
+        f"You are the {SERVER_NAME} support assistant inside Ticket #{ticket_no} ({topic}). "
+        f"Help the member clearly and briefly. Be friendly and practical. "
+        f"If the issue needs a human (bans, payments, giveaway claims, disputes, role fixes), "
+        f"tell them to press **Remind Staff**. "
+        f"Never invent server rules or staff decisions. Never mention internal AI providers. "
+        f"Keep replies under 180 words."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": message.content.strip()[:1500]},
+    ]
+    async with message.channel.typing():
+        reply = None
+        try:
+            reply = await _gemini_chat(messages)
+        except Exception:
+            reply = None
+        if not reply and groq_api_key:
+            try:
+                reply, _model = await _groq_fallback_chat(messages)
+            except Exception:
+                reply = None
+        if not reply:
+            return
+        reply = reply.strip()
+        if len(reply) > 1900:
+            reply = reply[:1900] + "…"
+        embed = discord.Embed(description=reply, color=DARK_FRUITS_PURPLE)
+        embed.set_author(name=f"{SERVER_NAME} Assistant", icon_url=THUMBNAIL_URL)
+        embed.set_footer(text=f"Ticket #{ticket_no} • {topic} • Press Remind Staff for a human")
+        await message.reply(embed=embed, mention_author=False)
 
 
 async def _handle_ai_mention(message: discord.Message) -> None:
@@ -4425,6 +4509,7 @@ async def _ensure_community_schema() -> None:
         "CREATE TABLE IF NOT EXISTS member_xp (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, xp INTEGER NOT NULL DEFAULT 0, level INTEGER NOT NULL DEFAULT 0, last_xp TEXT, PRIMARY KEY(guild_id,user_id))",
         "CREATE TABLE IF NOT EXISTS level_rewards (guild_id INTEGER NOT NULL, level INTEGER NOT NULL, role_id INTEGER NOT NULL, PRIMARY KEY(guild_id,level))",
         "CREATE TABLE IF NOT EXISTS afk_members (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, reason TEXT NOT NULL, since TEXT NOT NULL, PRIMARY KEY(guild_id,user_id))",
+        "CREATE TABLE IF NOT EXISTS afk_pings (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, afk_user_id INTEGER NOT NULL, pinger_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL, pinged_at TEXT NOT NULL)",
         "CREATE TABLE IF NOT EXISTS df_tickets (channel_id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, opener_id INTEGER NOT NULL, opened_at TEXT NOT NULL, closed_at TEXT, claimed_by INTEGER)",
         "CREATE TABLE IF NOT EXISTS df_vouches (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, giver_id INTEGER NOT NULL, receiver_id INTEGER NOT NULL, details TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(guild_id,giver_id,receiver_id,details))",
         "CREATE TABLE IF NOT EXISTS df_warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, moderator_id INTEGER NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1)",
@@ -4503,28 +4588,135 @@ async def _make_levelup_card(member: discord.Member, level: int, xp: int, needed
         return None
 
 
+
+async def _ensure_afk_tables() -> None:
+    """Always ensure AFK tables exist (safe after schema flag is already set)."""
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS afk_members ("
+        "guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, reason TEXT NOT NULL, "
+        "since TEXT NOT NULL, PRIMARY KEY(guild_id,user_id))"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS afk_pings ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, "
+        "afk_user_id INTEGER NOT NULL, pinger_id INTEGER NOT NULL, "
+        "channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL, pinged_at TEXT NOT NULL)"
+    )
+
+
 @bot.listen("on_message")
 async def community_message_features(message: discord.Message):
     if not message.guild or message.author.bot or message.webhook_id:
         return
     try:
         await _ensure_community_schema()
-        # AFK state is cleared on the member's next message.
-        afk = await db.fetchone("SELECT reason, since FROM afk_members WHERE guild_id = ? AND user_id = ?", (message.guild.id, message.author.id))
+        await _ensure_afk_tables()
+        # ── AFK: clear on return + deliver missed-ping summary ──
+        afk = await db.fetchone(
+            "SELECT reason, since FROM afk_members WHERE guild_id = ? AND user_id = ?",
+            (message.guild.id, message.author.id),
+        )
         if afk:
-            await db.execute("DELETE FROM afk_members WHERE guild_id = ? AND user_id = ?", (message.guild.id, message.author.id))
+            await db.execute(
+                "DELETE FROM afk_members WHERE guild_id = ? AND user_id = ?",
+                (message.guild.id, message.author.id),
+            )
+            pings = await db.fetchall(
+                "SELECT pinger_id, channel_id, message_id, pinged_at FROM afk_pings "
+                "WHERE guild_id = ? AND afk_user_id = ? ORDER BY id DESC LIMIT 15",
+                (message.guild.id, message.author.id),
+            )
+            await db.execute(
+                "DELETE FROM afk_pings WHERE guild_id = ? AND afk_user_id = ?",
+                (message.guild.id, message.author.id),
+            )
             try:
-                await message.reply("👋 Welcome back! I've removed your AFK status.", mention_author=False, delete_after=8)
+                since_txt = ""
+                try:
+                    since_dt = datetime.datetime.fromisoformat(afk["since"])
+                    since_txt = f" · away since <t:{int(since_dt.timestamp())}:R>"
+                except Exception:
+                    pass
+                welcome = discord.Embed(
+                    title="👋 Welcome back!",
+                    description=f"Your AFK status has been cleared{since_txt}.",
+                    color=DARK_FRUITS_PURPLE,
+                )
+                welcome.set_thumbnail(url=THUMBNAIL_URL)
+                await message.reply(embed=welcome, mention_author=False, delete_after=12)
             except discord.HTTPException:
                 pass
-        # Notify authors when they mention an AFK member.
-        for mentioned in message.mentions[:5]:
-            row = await db.fetchone("SELECT reason, since FROM afk_members WHERE guild_id = ? AND user_id = ?", (message.guild.id, mentioned.id))
-            if row:
+            if pings:
+                lines = []
+                for p in pings:
+                    jump = f"https://discord.com/channels/{message.guild.id}/{p['channel_id']}/{p['message_id']}"
+                    when = ""
+                    try:
+                        when = f" · <t:{int(datetime.datetime.fromisoformat(p['pinged_at']).timestamp())}:R>"
+                    except Exception:
+                        pass
+                    lines.append(f"• <@{p['pinger_id']}> in <#{p['channel_id']}>{when}\n  [Jump to message]({jump})")
+                ping_embed = discord.Embed(
+                    title=f"📬 You were mentioned while AFK ({len(pings)})",
+                    description="\n".join(lines)[:4000],
+                    color=DARK_FRUITS_PURPLE,
+                )
+                ping_embed.set_footer(text=f"{SERVER_NAME} AFK · Click a link to jump")
+                ping_embed.set_thumbnail(url=THUMBNAIL_URL)
                 try:
-                    await message.reply(f"💤 **{mentioned.display_name} is AFK:** {row['reason']}", mention_author=False, delete_after=12)
-                except discord.HTTPException:
-                    pass
+                    await message.author.send(embed=ping_embed)
+                except Exception:
+                    try:
+                        await message.channel.send(
+                            content=message.author.mention,
+                            embed=ping_embed,
+                            delete_after=60,
+                        )
+                    except Exception:
+                        pass
+
+        # ── AFK: notify pingers + log the ping for the AFK member ──
+        for mentioned in message.mentions[:8]:
+            if mentioned.bot or mentioned.id == message.author.id:
+                continue
+            row = await db.fetchone(
+                "SELECT reason, since FROM afk_members WHERE guild_id = ? AND user_id = ?",
+                (message.guild.id, mentioned.id),
+            )
+            if not row:
+                continue
+            try:
+                await db.execute(
+                    "INSERT INTO afk_pings (guild_id, afk_user_id, pinger_id, channel_id, message_id, pinged_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        message.guild.id,
+                        mentioned.id,
+                        message.author.id,
+                        message.channel.id,
+                        message.id,
+                        datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    ),
+                )
+            except Exception:
+                log.debug("afk_pings insert failed", exc_info=True)
+            since_bit = ""
+            try:
+                since_dt = datetime.datetime.fromisoformat(row["since"])
+                since_bit = f"\n⏰ Away since <t:{int(since_dt.timestamp())}:R>"
+            except Exception:
+                pass
+            afk_embed = discord.Embed(
+                title=f"💤 {mentioned.display_name} is AFK",
+                description=f"**Reason:** {row['reason'][:500]}{since_bit}",
+                color=discord.Color.dark_grey(),
+            )
+            afk_embed.set_thumbnail(url=mentioned.display_avatar.url)
+            afk_embed.set_footer(text="They'll get a jump link to this message when they return")
+            try:
+                await message.reply(embed=afk_embed, mention_author=False, delete_after=20)
+            except discord.HTTPException:
+                pass
         # XP uses a persisted one-minute cooldown to prevent spam farming.
         row = await db.fetchone("SELECT xp, level, last_xp FROM member_xp WHERE guild_id = ? AND user_id = ?", (message.guild.id, message.author.id))
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -4595,24 +4787,41 @@ async def community_level_leaderboard(interaction: discord.Interaction):
     if not interaction.guild:
         return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
     await _ensure_community_schema()
-    rows = await db.fetchall("SELECT user_id, level, xp FROM member_xp WHERE guild_id = ? ORDER BY level DESC, xp DESC LIMIT 10", (interaction.guild.id,))
+    rows = await db.fetchall(
+        "SELECT user_id, level, xp FROM member_xp WHERE guild_id = ? ORDER BY level DESC, xp DESC LIMIT 10",
+        (interaction.guild.id,),
+    )
     lines = []
     for i, row in enumerate(rows, 1):
         member = interaction.guild.get_member(int(row["user_id"]))
         label = member.display_name if member else f"User {row['user_id']}"
         lines.append(f"**{i}.** {label} — Level `{row['level']}` · `{row['xp']} XP`")
-    await interaction.response.send_message(embed=_suite_embed("🏆 XP Leaderboard", "\n".join(lines) or "No XP earned yet. Send messages to start levelling up!"))
+    await interaction.response.send_message(
+        embed=_suite_embed(
+            "🏆 XP Leaderboard",
+            "\n".join(lines) or "No XP earned yet. Send messages to start levelling up!",
+        )
+    )
 
 
 @bot.tree.command(name="set_level_reward", description="Set a role reward for a level (staff only).")
 @app_commands.describe(level="Level required", role="Role to grant at that level")
 @app_commands.checks.has_permissions(manage_roles=True)
-async def community_set_level_reward(interaction: discord.Interaction, level: app_commands.Range[int, 1, 10000], role: discord.Role):
-    if role >= interaction.guild.me.top_role:
-        return await interaction.response.send_message("I can't grant a role equal to or above my highest role.", ephemeral=True)
+async def community_set_level_reward(interaction: discord.Interaction, level: int, role: discord.Role):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
+    if level < 1 or level > 1000:
+        return await interaction.response.send_message("Level must be between 1 and 1000.", ephemeral=True)
     await _ensure_community_schema()
-    await db.execute("INSERT INTO level_rewards (guild_id,level,role_id) VALUES (?,?,?) ON CONFLICT(guild_id,level) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, level, role.id))
-    await interaction.response.send_message(f"✅ Members will receive {role.mention} when they reach **Level {level}** (if my role can manage it).", ephemeral=True)
+    await db.execute(
+        "INSERT INTO level_rewards (guild_id, level, role_id) VALUES (?,?,?) "
+        "ON CONFLICT(guild_id, level) DO UPDATE SET role_id=excluded.role_id",
+        (interaction.guild.id, level, role.id),
+    )
+    await interaction.response.send_message(
+        f"✅ Members who reach **Level {level}** will receive {role.mention}.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="afk", description="Set your AFK status and an optional reason.")
@@ -4621,8 +4830,33 @@ async def community_afk(interaction: discord.Interaction, reason: str = "Away fr
     if not interaction.guild:
         return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
     await _ensure_community_schema()
-    await db.execute("INSERT INTO afk_members (guild_id,user_id,reason,since) VALUES (?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET reason=excluded.reason,since=excluded.since", (interaction.guild.id, interaction.user.id, reason[:500], datetime.datetime.now(datetime.timezone.utc).isoformat()))
-    await interaction.response.send_message(f"💤 AFK enabled: **{reason[:500]}**\nI'll clear it when you next send a message.", ephemeral=True)
+    await _ensure_afk_tables()
+    await db.execute(
+        "INSERT INTO afk_members (guild_id,user_id,reason,since) VALUES (?,?,?,?) "
+        "ON CONFLICT(guild_id,user_id) DO UPDATE SET reason=excluded.reason,since=excluded.since",
+        (
+            interaction.guild.id,
+            interaction.user.id,
+            reason[:500],
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        ),
+    )
+    await db.execute(
+        "DELETE FROM afk_pings WHERE guild_id = ? AND afk_user_id = ?",
+        (interaction.guild.id, interaction.user.id),
+    )
+    embed = discord.Embed(
+        title="💤 AFK enabled",
+        description=(
+            f"**Reason:** {reason[:500]}\n\n"
+            "When someone pings you, I'll tell them you're away and **why**.\n"
+            "When you come back, you'll get a list of pings with **Jump to message** links.\n"
+            "AFK clears automatically on your next message."
+        ),
+        color=DARK_FRUITS_PURPLE,
+    )
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="warn_member", description="Issue a recorded warning (staff only).")
@@ -4953,7 +5187,11 @@ async def mega_counting_game(message: discord.Message):
         log.exception("Counting game handler failed")
 
 
-@bot.tree.command(name="ticket_open", description="Open a private support ticket.")
+tickets_group = app_commands.Group(name="tickets", description="Support ticket actions")
+bot.tree.add_command(tickets_group)
+
+
+@tickets_group.command(name="open", description="Open a private support ticket.")
 @app_commands.describe(topic="Briefly describe what you need help with")
 async def community_ticket_open(interaction: discord.Interaction, topic: str = "General support"):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -4978,7 +5216,7 @@ async def community_ticket_open(interaction: discord.Interaction, topic: str = "
     await interaction.response.send_message(f"✅ Your private ticket is ready: {channel.mention}", ephemeral=True)
 
 
-@bot.tree.command(name="ticket_claim", description="Claim the current support ticket (staff only).")
+@tickets_group.command(name="claim", description="Claim the current support ticket (staff only).")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def community_ticket_claim(interaction: discord.Interaction):
     if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
@@ -4991,7 +5229,7 @@ async def community_ticket_claim(interaction: discord.Interaction):
     await interaction.response.send_message(f"🫡 {interaction.user.mention} has claimed this ticket.")
 
 
-@bot.tree.command(name="ticket_close", description="Close the current support ticket.")
+@tickets_group.command(name="close", description="Close the current support ticket.")
 @app_commands.describe(reason="Reason for closing")
 async def community_ticket_close(interaction: discord.Interaction, reason: str = "Resolved"):
     if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
@@ -5528,6 +5766,929 @@ async def before_mega_monthly_leaderboard():
 async def start_mega_monthly_leaderboard():
     if not mega_monthly_leaderboard.is_running():
         mega_monthly_leaderboard.start()
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURABLE TICKET PANELS + DOOMICY-STYLE TICKET ROOM
+# Staff post a panel, then ADD buttons + form fields themselves (no hard-coded buttons).
+# Field types: short (one-line), long (paragraph), dropdown (select menu).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STYLE_MAP = {
+    "blurple": discord.ButtonStyle.primary,
+    "blue": discord.ButtonStyle.primary,
+    "grey": discord.ButtonStyle.secondary,
+    "gray": discord.ButtonStyle.secondary,
+    "green": discord.ButtonStyle.success,
+    "red": discord.ButtonStyle.danger,
+}
+
+
+async def _ticket_panel_schema() -> None:
+    await _ensure_community_schema()
+    for statement in (
+        """CREATE TABLE IF NOT EXISTS df_ticket_panels (
+            message_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS df_ticket_panel_buttons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            style TEXT NOT NULL DEFAULT 'blurple',
+            emoji TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS df_ticket_panel_fields (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            button_id INTEGER NOT NULL,
+            field_type TEXT NOT NULL,
+            label TEXT NOT NULL,
+            options TEXT,
+            required INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )""",
+        """CREATE TABLE IF NOT EXISTS df_ticket_counter (
+            guild_id INTEGER PRIMARY KEY,
+            next_num INTEGER NOT NULL DEFAULT 1
+        )""",
+        """CREATE TABLE IF NOT EXISTS df_ticket_meta (
+            channel_id INTEGER PRIMARY KEY,
+            ticket_number INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            staff_reminded INTEGER NOT NULL DEFAULT 0,
+            ai_paused INTEGER NOT NULL DEFAULT 0
+        )""",
+    ):
+        await db.execute(statement)
+
+
+def _button_style(name: str) -> discord.ButtonStyle:
+    return _STYLE_MAP.get((name or "blurple").lower(), discord.ButtonStyle.primary)
+
+
+async def _next_ticket_number(guild_id: int) -> int:
+    await _ticket_panel_schema()
+    row = await db.fetchone("SELECT next_num FROM df_ticket_counter WHERE guild_id = ?", (guild_id,))
+    if not row:
+        await db.execute("INSERT INTO df_ticket_counter (guild_id, next_num) VALUES (?, 2)", (guild_id,))
+        return 1
+    num = int(row["next_num"])
+    await db.execute("UPDATE df_ticket_counter SET next_num = ? WHERE guild_id = ?", (num + 1, guild_id))
+    return num
+
+
+async def _finalize_ticket_close(interaction: discord.Interaction, channel: discord.TextChannel, reason: str) -> None:
+    row = await db.fetchone(
+        "SELECT opener_id FROM df_tickets WHERE channel_id = ? AND closed_at IS NULL",
+        (channel.id,),
+    )
+    if not row:
+        try:
+            await interaction.followup.send("Ticket already closed.", ephemeral=True)
+        except Exception:
+            pass
+        return
+    await db.execute(
+        "UPDATE df_tickets SET closed_at = ? WHERE channel_id = ?",
+        (datetime.datetime.now(datetime.timezone.utc).isoformat(), channel.id),
+    )
+    await _ticket_panel_schema()
+    await db.execute(
+        "UPDATE df_ticket_meta SET ai_paused = 1 WHERE channel_id = ?",
+        (channel.id,),
+    )
+    # Build transcript before locking the channel
+    transcript_file = None
+    try:
+        import io
+        meta = await db.fetchone(
+            "SELECT ticket_number, topic FROM df_ticket_meta WHERE channel_id = ?",
+            (channel.id,),
+        )
+        num = int(meta["ticket_number"]) if meta else 0
+        topic = (meta["topic"] if meta else "Support") or "Support"
+        lines = [
+            f"{SERVER_NAME} Ticket Transcript",
+            f"Ticket #{num} • {topic}",
+            f"Channel: #{channel.name} ({channel.id})",
+            f"Guild: {channel.guild.name} ({channel.guild.id})",
+            f"Opener ID: {row['opener_id']}",
+            f"Closed by: {interaction.user} ({interaction.user.id})",
+            f"Reason: {reason}",
+            "=" * 72,
+            "",
+        ]
+        async for item in channel.history(limit=400, oldest_first=True):
+            ts = item.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            body = item.content or "[no text]"
+            if item.attachments:
+                body += "\nAttachments: " + ", ".join(a.url for a in item.attachments)
+            if item.embeds:
+                body += f"\n[Embeds: {len(item.embeds)}]"
+            lines.append(f"[{ts}] {item.author} ({item.author.id}):\n{body}\n")
+        raw = "\n".join(lines).encode("utf-8", errors="replace")[:7_500_000]
+        transcript_file = discord.File(io.BytesIO(raw), filename=f"ticket-{num or channel.id}-transcript.txt")
+    except Exception:
+        log.exception("Ticket transcript build failed")
+
+    try:
+        await channel.edit(
+            name=f"closed-{channel.name}"[:95],
+            reason=f"Closed by {interaction.user}: {reason[:200]}",
+        )
+        await channel.set_permissions(channel.guild.default_role, view_channel=False)
+        opener = channel.guild.get_member(int(row["opener_id"]))
+        if opener:
+            await channel.set_permissions(opener, view_channel=False, send_messages=False)
+    except Exception:
+        log.exception("Ticket close channel edit failed")
+    try:
+        await channel.send(
+            f"🔒 Ticket closed by {interaction.user.mention}.\n**Reason:** {reason[:500]}\n"
+            f"_Channel will be deleted in 15 seconds._"
+        )
+    except Exception:
+        pass
+    try:
+        await interaction.followup.send("✅ Ticket closed. Transcript saved to the log channel (if configured).", ephemeral=True)
+    except Exception:
+        pass
+    log_id = int(os.environ.get("TICKET_LOG_CHANNEL_ID", "0") or 0)
+    log_channel = channel.guild.get_channel(log_id) if log_id else None
+    if isinstance(log_channel, discord.TextChannel):
+        try:
+            embed = _suite_embed(
+                "🎫 Ticket closed",
+                f"**Channel:** #{channel.name}\n**Opener:** <@{row['opener_id']}>\n"
+                f"**Closed by:** {interaction.user.mention}\n**Reason:** {reason[:700]}",
+            )
+            if transcript_file:
+                await log_channel.send(embed=embed, file=transcript_file)
+            else:
+                await log_channel.send(embed=embed)
+        except Exception:
+            log.exception("Ticket log send failed")
+
+    async def _delete_later():
+        await asyncio.sleep(15)
+        try:
+            await channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception:
+            log.debug("Ticket channel delete failed for %s", channel.id, exc_info=True)
+
+    bot.loop.create_task(_delete_later())
+
+
+class TicketCloseReasonModal(discord.ui.Modal, title="Close ticket with reason"):
+    reason = discord.ui.TextInput(
+        label="Reason", style=discord.TextStyle.paragraph, required=True, max_length=500
+    )
+
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self._channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await _finalize_ticket_close(interaction, self._channel, str(self.reason.value))
+
+
+class TicketControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="df:ticket:ctrl:close")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Invalid channel.", ephemeral=True)
+        row = await db.fetchone(
+            "SELECT opener_id FROM df_tickets WHERE channel_id = ? AND closed_at IS NULL",
+            (interaction.channel.id,),
+        )
+        if not row:
+            return await interaction.response.send_message("This ticket is already closed.", ephemeral=True)
+        member_ok = isinstance(interaction.user, discord.Member) and is_staff(interaction.user)
+        if interaction.user.id != int(row["opener_id"]) and not member_ok:
+            return await interaction.response.send_message(
+                "Only the ticket owner or staff can close this.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True)
+        await _finalize_ticket_close(interaction, interaction.channel, "Closed")
+
+    @discord.ui.button(
+        label="Close with Reason",
+        style=discord.ButtonStyle.primary,
+        emoji="📝",
+        custom_id="df:ticket:ctrl:close_reason",
+    )
+    async def close_reason_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Invalid channel.", ephemeral=True)
+        row = await db.fetchone(
+            "SELECT opener_id FROM df_tickets WHERE channel_id = ? AND closed_at IS NULL",
+            (interaction.channel.id,),
+        )
+        if not row:
+            return await interaction.response.send_message("This ticket is already closed.", ephemeral=True)
+        member_ok = isinstance(interaction.user, discord.Member) and is_staff(interaction.user)
+        if interaction.user.id != int(row["opener_id"]) and not member_ok:
+            return await interaction.response.send_message(
+                "Only the ticket owner or staff can close this.", ephemeral=True
+            )
+        await interaction.response.send_modal(TicketCloseReasonModal(interaction.channel))
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success, emoji="✅", custom_id="df:ticket:ctrl:claim")
+    async def claim_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Invalid channel.", ephemeral=True)
+        row = await db.fetchone(
+            "SELECT channel_id FROM df_tickets WHERE channel_id = ? AND closed_at IS NULL",
+            (interaction.channel.id,),
+        )
+        if not row:
+            return await interaction.response.send_message("This isn't an open ticket.", ephemeral=True)
+        await db.execute(
+            "UPDATE df_tickets SET claimed_by = ? WHERE channel_id = ?",
+            (interaction.user.id, interaction.channel.id),
+        )
+        await _ticket_panel_schema()
+        await db.execute(
+            "UPDATE df_ticket_meta SET ai_paused = 1 WHERE channel_id = ?",
+            (interaction.channel.id,),
+        )
+        try:
+            topic = interaction.channel.topic or ""
+            if "Staff Requested:" in topic:
+                topic = topic.replace("Staff Requested: no", "Staff Requested: yes (claimed)")
+            else:
+                topic = (topic + f" • Claimed by {interaction.user}").strip(" •")
+            await interaction.channel.edit(topic=topic[:1024], reason=f"Claimed by {interaction.user}")
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            f"🫡 {interaction.user.mention} has **claimed** this ticket. Assistant is paused."
+        )
+
+
+class TicketAssistantView(discord.ui.View):
+    def __init__(self, ticket_number: int = 0, topic: str = "Support"):
+        super().__init__(timeout=None)
+        self.ticket_number = ticket_number
+        self.topic = topic
+
+    @discord.ui.button(
+        label="What Do I Send?",
+        style=discord.ButtonStyle.primary,
+        emoji="📌",
+        custom_id="df:ticket:asst:checklist",
+    )
+    async def checklist_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _ticket_panel_schema()
+        meta = None
+        if isinstance(interaction.channel, discord.TextChannel):
+            meta = await db.fetchone(
+                "SELECT topic FROM df_ticket_meta WHERE channel_id = ?",
+                (interaction.channel.id,),
+            )
+        topic = (meta["topic"] if meta else self.topic) or "Support"
+        embed = discord.Embed(
+            title=f"📌 Checklist • {topic}",
+            description=(
+                "Include as much of this as you can so staff can help faster:\n\n"
+                "• Your **Roblox username**\n"
+                "• What you need help with (be specific)\n"
+                "• Screenshots or proof if relevant\n"
+                "• What result you want\n"
+                "• Anything already tried\n\n"
+                "Just type normally in this channel — no need to ping the bot."
+            ),
+            color=DARK_FRUITS_PURPLE,
+        )
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="Remind Staff",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔔",
+        custom_id="df:ticket:asst:remind",
+    )
+    async def remind_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.TextChannel) or not interaction.guild:
+            return await interaction.response.send_message("Invalid channel.", ephemeral=True)
+        await _ticket_panel_schema()
+        meta = await db.fetchone(
+            "SELECT ticket_number, topic, staff_reminded FROM df_ticket_meta WHERE channel_id = ?",
+            (interaction.channel.id,),
+        )
+        trow = await db.fetchone(
+            "SELECT opener_id FROM df_tickets WHERE channel_id = ? AND closed_at IS NULL",
+            (interaction.channel.id,),
+        )
+        if not trow:
+            return await interaction.response.send_message("This ticket is closed.", ephemeral=True)
+        member_ok = isinstance(interaction.user, discord.Member) and is_staff(interaction.user)
+        if interaction.user.id != int(trow["opener_id"]) and not member_ok:
+            return await interaction.response.send_message(
+                "Only the ticket owner can remind staff.", ephemeral=True
+            )
+        if meta and int(meta["staff_reminded"] or 0):
+            return await interaction.response.send_message(
+                "Staff has already been reminded for this ticket.", ephemeral=True
+            )
+        await db.execute(
+            "UPDATE df_ticket_meta SET staff_reminded = 1, ai_paused = 1 WHERE channel_id = ?",
+            (interaction.channel.id,),
+        )
+        staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
+        num = int(meta["ticket_number"]) if meta else 0
+        topic = (meta["topic"] if meta else self.topic) or "Support"
+        embed = discord.Embed(
+            title="🔔 Staff Team needed",
+            description=(
+                f"{interaction.user.mention} asked me to bring staff into "
+                f"**Ticket #{num}**.\n\n"
+                f"**Ticket type:** {topic}\n\n"
+                f"**They need help with:**\n> They need help with this ticket.\n\n"
+                f"Please check the ticket when available."
+            ),
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text="Requested with Remind Staff")
+        await interaction.response.send_message(
+            content=staff_role.mention if staff_role else None,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=bool(staff_role)),
+        )
+
+    @discord.ui.button(
+        label="Staff Summary",
+        style=discord.ButtonStyle.secondary,
+        emoji="📋",
+        custom_id="df:ticket:asst:summary",
+    )
+    async def staff_summary_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+            return await interaction.response.send_message("Staff only.", ephemeral=True)
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Invalid channel.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        await _ticket_panel_schema()
+        meta = await db.fetchone(
+            "SELECT ticket_number, topic, staff_reminded FROM df_ticket_meta WHERE channel_id = ?",
+            (interaction.channel.id,),
+        )
+        trow = await db.fetchone(
+            "SELECT opener_id, claimed_by, opened_at FROM df_tickets WHERE channel_id = ?",
+            (interaction.channel.id,),
+        )
+        lines = []
+        async for item in interaction.channel.history(limit=40, oldest_first=False):
+            if item.author.bot and not item.content:
+                continue
+            snippet = (item.content or "[embed/attachment]")[:180]
+            lines.append(f"**{item.author.display_name}:** {snippet}")
+            if len(lines) >= 12:
+                break
+        lines.reverse()
+        num = int(meta["ticket_number"]) if meta else 0
+        topic = (meta["topic"] if meta else "Support") or "Support"
+        claimed = f"<@{trow['claimed_by']}>" if trow and trow["claimed_by"] else "Unclaimed"
+        reminded = "Yes" if meta and int(meta["staff_reminded"] or 0) else "No"
+        opener = f"<@{trow['opener_id']}>" if trow else "—"
+        embed = discord.Embed(
+            title=f"📋 Staff Summary • Ticket #{num}",
+            description=(
+                f"**Type:** {topic}\n**Opener:** {opener}\n"
+                f"**Claimed by:** {claimed}\n**Staff reminded:** {reminded}\n\n"
+                f"**Recent messages:**\n" + ("\n".join(lines) if lines else "_No messages yet._")
+            )[:4000],
+            color=DARK_FRUITS_PURPLE,
+        )
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+async def _create_ticket_channel(
+    guild: discord.Guild,
+    opener: discord.Member,
+    topic: str,
+    answers: list[tuple[str, str]],
+) -> discord.TextChannel:
+    """Create a private ticket channel with numbered welcome + assistant panel."""
+    await _ticket_panel_schema()
+    category_id = int(os.environ.get("TICKET_CATEGORY_ID", "0") or 0)
+    category = guild.get_channel(category_id) if category_id else None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        opener: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, attach_files=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, manage_channels=True
+        ),
+    }
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
+    ticket_no = await _next_ticket_number(guild.id)
+    safe = re.sub(r"[^a-z0-9-]", "", opener.name.lower().replace(" ", "-"))[:12] or str(opener.id)
+    channel = await guild.create_text_channel(
+        f"ticket-{ticket_no}-{safe}"[:95],
+        category=category if isinstance(category, discord.CategoryChannel) else None,
+        overwrites=overwrites,
+        topic=f"Ticket #{ticket_no} • {topic} • Ticket Owner: {opener.id} • Staff Requested: no",
+        reason=f"Ticket #{ticket_no} opened by {opener} ({topic})",
+    )
+    await db.execute(
+        "INSERT INTO df_tickets (channel_id,guild_id,opener_id,opened_at,closed_at,claimed_by) VALUES (?,?,?,?,NULL,NULL)",
+        (channel.id, guild.id, opener.id, datetime.datetime.now(datetime.timezone.utc).isoformat()),
+    )
+    await db.execute(
+        "INSERT OR REPLACE INTO df_ticket_meta (channel_id, ticket_number, topic, staff_reminded, ai_paused) VALUES (?,?,?,0,0)",
+        (channel.id, ticket_no, topic[:200]),
+    )
+
+    welcome = discord.Embed(
+        title=f"📩 Ticket #{ticket_no} • {topic}",
+        description=(
+            f"Welcome {opener.mention}!\n\n"
+            f"**Ticket type:** {topic}\n"
+            f"**What to do:** Explain clearly why you opened this ticket and include any useful information.\n\n"
+            f"**{SERVER_NAME} Assistant will help first.**\n"
+            f"If you need an actual staff member, press **Remind Staff** on the Assistant panel.\n\n"
+            f"> Staff is not pinged automatically when a ticket opens."
+        ),
+        color=DARK_FRUITS_PURPLE,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    welcome.set_thumbnail(url=THUMBNAIL_URL)
+    for label, value in answers:
+        welcome.add_field(name=f"📋 {label}"[:256], value=(value or "—")[:1024], inline=False)
+    welcome.set_footer(text=f"{SERVER_NAME} • Private Support Ticket", icon_url=THUMBNAIL_URL)
+
+    controls = TicketControlsView()
+    await channel.send(content=opener.mention, embed=welcome, view=controls)
+    bot.add_view(controls)
+
+    assistant = discord.Embed(
+        title="🤖 Hey! I can help here first",
+        description=(
+            "**Your ticket is open.**\n\n"
+            "> I can help with the normal server parts of your question while this ticket is open.\n\n"
+            "**Want to ask me something?**\n"
+            "Just **type normally in this ticket**. You do not need to ping me while the ticket is waiting for staff.\n"
+            "I will automatically answer messages from the person who opened the ticket.\n\n"
+            "**Need an actual staff member?**\n"
+            "Press 🔔 **Remind Staff** below and I will ping Staff Team for you.\n"
+            "New tickets do **not** ping staff automatically, so nobody gets spammed twice.\n\n"
+            "Once Staff Team is reminded or a staff member claims the ticket, I stay quiet "
+            "unless the ticket owner pings me.\n\n"
+            "📌 **Not sure what to send?**\n"
+            "Press **What Do I Send?** for a checklist made for this ticket type."
+        ),
+        color=DARK_FRUITS_PURPLE,
+        timestamp=datetime.datetime.now(datetime.timezone.utc),
+    )
+    assistant.set_thumbnail(url=THUMBNAIL_URL)
+    assistant.set_footer(text=f"Ticket #{ticket_no} • {topic} • Just type normally for help")
+    asst_view = TicketAssistantView(ticket_no, topic)
+    await channel.send(embed=assistant, view=asst_view)
+    bot.add_view(asst_view)
+    return channel
+
+
+class TicketFormModal(discord.ui.Modal):
+    def __init__(self, button_id: int, topic: str, text_fields: list, dropdown_answers: dict[str, str]):
+        super().__init__(title=topic[:45] or "Support ticket")
+        self.button_id = button_id
+        self.topic = topic
+        self.text_fields = text_fields
+        self.dropdown_answers = dropdown_answers
+        self._inputs: list[discord.ui.TextInput] = []
+        for field in text_fields[:5]:
+            style = discord.TextStyle.paragraph if field["field_type"] == "long" else discord.TextStyle.short
+            ti = discord.ui.TextInput(
+                label=field["label"][:45],
+                style=style,
+                required=bool(field.get("required", 1)),
+                max_length=1000 if field["field_type"] == "long" else 200,
+            )
+            self._inputs.append(ti)
+            self.add_item(ti)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Tickets only work inside a server.", ephemeral=True)
+        await _ticket_panel_schema()
+        existing = await db.fetchone(
+            "SELECT channel_id FROM df_tickets WHERE guild_id = ? AND opener_id = ? AND closed_at IS NULL",
+            (interaction.guild.id, interaction.user.id),
+        )
+        if existing:
+            ch = interaction.guild.get_channel(int(existing["channel_id"]))
+            if ch:
+                return await interaction.response.send_message(
+                    f"You already have an open ticket: {ch.mention}", ephemeral=True
+                )
+        answers: list[tuple[str, str]] = list(self.dropdown_answers.items())
+        for field, ti in zip(self.text_fields, self._inputs):
+            answers.append((field["label"], str(ti.value or "").strip()))
+        await interaction.response.defer(ephemeral=True)
+        try:
+            channel = await _create_ticket_channel(interaction.guild, interaction.user, self.topic, answers)
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            log.exception("Ticket create failed")
+            await interaction.followup.send(f"❌ Could not create ticket: {e}", ephemeral=True)
+
+
+class TicketDropdownView(discord.ui.View):
+    def __init__(self, button_id: int, topic: str, dropdown_fields: list, text_fields: list):
+        super().__init__(timeout=300)
+        self.button_id = button_id
+        self.topic = topic
+        self.dropdown_fields = dropdown_fields
+        self.text_fields = text_fields
+        self.answers: dict[str, str] = {}
+        for field in dropdown_fields[:5]:
+            opts_raw = field.get("options") or ""
+            options = [o.strip() for o in opts_raw.split("|") if o.strip()][:25] or ["Other"]
+            select = discord.ui.Select(
+                placeholder=field["label"][:150],
+                options=[discord.SelectOption(label=o[:100], value=o[:100]) for o in options],
+                min_values=1 if field.get("required", 1) else 0,
+                max_values=1,
+                custom_id=f"df:tdd:{button_id}:{field['id']}",
+            )
+            select.callback = self._make_select_callback(field["label"], select)
+            self.add_item(select)
+        cont = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success, emoji="➡️")
+        cont.callback = self._continue
+        self.add_item(cont)
+
+    def _make_select_callback(self, label: str, select: discord.ui.Select):
+        async def _cb(interaction: discord.Interaction):
+            if select.values:
+                self.answers[label] = select.values[0]
+            await interaction.response.defer()
+        return _cb
+
+    async def _continue(self, interaction: discord.Interaction):
+        missing = [
+            f["label"]
+            for f in self.dropdown_fields
+            if f.get("required", 1) and f["label"] not in self.answers
+        ]
+        if missing:
+            return await interaction.response.send_message(
+                f"Please choose: {', '.join(missing)}", ephemeral=True
+            )
+        if self.text_fields:
+            await interaction.response.send_modal(
+                TicketFormModal(self.button_id, self.topic, self.text_fields, self.answers)
+            )
+            return
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Tickets only work inside a server.", ephemeral=True)
+        await _ticket_panel_schema()
+        existing = await db.fetchone(
+            "SELECT channel_id FROM df_tickets WHERE guild_id = ? AND opener_id = ? AND closed_at IS NULL",
+            (interaction.guild.id, interaction.user.id),
+        )
+        if existing:
+            ch = interaction.guild.get_channel(int(existing["channel_id"]))
+            if ch:
+                return await interaction.response.send_message(
+                    f"You already have an open ticket: {ch.mention}", ephemeral=True
+                )
+        await interaction.response.defer(ephemeral=True)
+        try:
+            channel = await _create_ticket_channel(
+                interaction.guild, interaction.user, self.topic, list(self.answers.items())
+            )
+            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            log.exception("Ticket create failed")
+            await interaction.followup.send(f"❌ Could not create ticket: {e}", ephemeral=True)
+
+
+class TicketPanelButton(discord.ui.Button):
+    def __init__(self, button_id: int, label: str, style: str, emoji: str | None):
+        kwargs = {
+            "style": _button_style(style),
+            "label": label[:80],
+            "custom_id": f"df:tpanel:{button_id}",
+        }
+        if emoji:
+            kwargs["emoji"] = emoji
+        super().__init__(**kwargs)
+        self.button_id = button_id
+        self.topic = label
+
+    async def callback(self, interaction: discord.Interaction):
+        await _ticket_panel_schema()
+        rows = await db.fetchall(
+            "SELECT id, field_type, label, options, required FROM df_ticket_panel_fields "
+            "WHERE button_id = ? ORDER BY sort_order, id",
+            (self.button_id,),
+        )
+        fields = [dict(r) for r in rows]
+        dropdowns = [f for f in fields if f["field_type"] == "dropdown"]
+        texts = [f for f in fields if f["field_type"] in ("short", "long")]
+        if dropdowns:
+            view = TicketDropdownView(self.button_id, self.topic, dropdowns, texts)
+            await interaction.response.send_message(
+                "Please complete the form below, then press **Continue**.",
+                view=view,
+                ephemeral=True,
+            )
+        elif texts:
+            await interaction.response.send_modal(
+                TicketFormModal(self.button_id, self.topic, texts, {})
+            )
+        else:
+            if not interaction.guild or not isinstance(interaction.user, discord.Member):
+                return await interaction.response.send_message(
+                    "Tickets only work inside a server.", ephemeral=True
+                )
+            existing = await db.fetchone(
+                "SELECT channel_id FROM df_tickets WHERE guild_id = ? AND opener_id = ? AND closed_at IS NULL",
+                (interaction.guild.id, interaction.user.id),
+            )
+            if existing:
+                ch = interaction.guild.get_channel(int(existing["channel_id"]))
+                if ch:
+                    return await interaction.response.send_message(
+                        f"You already have an open ticket: {ch.mention}", ephemeral=True
+                    )
+            await interaction.response.defer(ephemeral=True)
+            try:
+                channel = await _create_ticket_channel(
+                    interaction.guild, interaction.user, self.topic, []
+                )
+                await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+            except Exception as e:
+                log.exception("Ticket create failed")
+                await interaction.followup.send(f"❌ Could not create ticket: {e}", ephemeral=True)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, buttons: list | None = None):
+        super().__init__(timeout=None)
+        for b in (buttons or [])[:25]:
+            self.add_item(
+                TicketPanelButton(
+                    int(b["id"]),
+                    str(b["label"]),
+                    str(b.get("style") or "blurple"),
+                    b.get("emoji"),
+                )
+            )
+
+
+async def _build_panel_view(message_id: int) -> TicketPanelView:
+    rows = await db.fetchall(
+        "SELECT id, label, style, emoji FROM df_ticket_panel_buttons WHERE message_id = ? ORDER BY sort_order, id",
+        (message_id,),
+    )
+    return TicketPanelView([dict(r) for r in rows])
+
+
+async def _refresh_panel_message(message_id: int, channel: discord.TextChannel) -> None:
+    view = await _build_panel_view(message_id)
+    try:
+        msg = await channel.fetch_message(message_id)
+        await msg.edit(view=view)
+        bot.add_view(view, message_id=message_id)
+    except Exception:
+        log.exception("Could not refresh ticket panel message %s", message_id)
+
+
+ticketpanel_group = app_commands.Group(name="ticketpanel", description="Build configurable ticket panels")
+bot.tree.add_command(ticketpanel_group)
+
+
+@ticketpanel_group.command(name="post", description="Staff: post a ticket panel (add buttons separately).")
+@app_commands.describe(title="Panel title", description="Panel description", channel="Channel to post in")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_panel_cmd(
+    interaction: discord.Interaction,
+    title: str,
+    description: str,
+    channel: discord.TextChannel | None = None,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("Server only.", ephemeral=True)
+    await _ticket_panel_schema()
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await interaction.response.send_message("Choose a text channel.", ephemeral=True)
+    embed = discord.Embed(title=title[:256], description=description[:4000], color=DARK_FRUITS_PURPLE)
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.set_footer(text=f"{SERVER_NAME} support", icon_url=THUMBNAIL_URL)
+    view = TicketPanelView([])
+    msg = await target.send(embed=embed, view=view)
+    await db.execute(
+        "INSERT OR REPLACE INTO df_ticket_panels (message_id, guild_id, channel_id, title, description) VALUES (?,?,?,?,?)",
+        (msg.id, interaction.guild.id, target.id, title[:256], description[:4000]),
+    )
+    bot.add_view(view, message_id=msg.id)
+    await interaction.response.send_message(
+        f"✅ Panel posted in {target.mention}.\n"
+        f"Message ID: `{msg.id}`\n"
+        f"Next: `/ticketpanel add_button` then `/ticketpanel add_field`.",
+        ephemeral=True,
+    )
+
+
+@ticketpanel_group.command(name="add_button", description="Staff: add a button to a ticket panel.")
+@app_commands.describe(message_id="Panel message ID", label="Button label", style="Colour", emoji="Optional emoji")
+@app_commands.choices(
+    style=[
+        app_commands.Choice(name="Blurple", value="blurple"),
+        app_commands.Choice(name="Grey", value="grey"),
+        app_commands.Choice(name="Green", value="green"),
+        app_commands.Choice(name="Red", value="red"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_add_button_cmd(
+    interaction: discord.Interaction,
+    message_id: str,
+    label: str,
+    style: str = "blurple",
+    emoji: str | None = None,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("Server only.", ephemeral=True)
+    await _ticket_panel_schema()
+    try:
+        mid = int(message_id.strip())
+    except ValueError:
+        return await interaction.response.send_message("Invalid message ID.", ephemeral=True)
+    panel = await db.fetchone(
+        "SELECT channel_id FROM df_ticket_panels WHERE message_id = ? AND guild_id = ?",
+        (mid, interaction.guild.id),
+    )
+    if not panel:
+        return await interaction.response.send_message("Panel not found. Use `/ticketpanel post` first.", ephemeral=True)
+    count = await db.fetchone("SELECT COUNT(*) AS c FROM df_ticket_panel_buttons WHERE message_id = ?", (mid,))
+    if count and int(count["c"]) >= 25:
+        return await interaction.response.send_message("Max 25 buttons per panel.", ephemeral=True)
+    await db.execute(
+        "INSERT INTO df_ticket_panel_buttons (message_id, label, style, emoji, sort_order) VALUES (?,?,?,?,?)",
+        (mid, label[:80], style, emoji, int(count["c"]) if count else 0),
+    )
+    channel = interaction.guild.get_channel(int(panel["channel_id"]))
+    if isinstance(channel, discord.TextChannel):
+        await _refresh_panel_message(mid, channel)
+    await interaction.response.send_message(
+        f"✅ Button **{label}** added. Optional: `/ticketpanel add_field` for form questions.",
+        ephemeral=True,
+    )
+
+
+@ticketpanel_group.command(name="add_field", description="Staff: add a form field to a panel button.")
+@app_commands.describe(
+    message_id="Panel message ID",
+    button_label="Exact button label",
+    field_type="short / long / dropdown",
+    field_label="Question for the user",
+    dropdown_options="Dropdown only — choices separated by |",
+    required="Must the user answer?",
+)
+@app_commands.choices(
+    field_type=[
+        app_commands.Choice(name="Short answer", value="short"),
+        app_commands.Choice(name="Long answer", value="long"),
+        app_commands.Choice(name="Dropdown", value="dropdown"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_add_field_cmd(
+    interaction: discord.Interaction,
+    message_id: str,
+    button_label: str,
+    field_type: str,
+    field_label: str,
+    dropdown_options: str | None = None,
+    required: bool = True,
+):
+    if not interaction.guild:
+        return await interaction.response.send_message("Server only.", ephemeral=True)
+    await _ticket_panel_schema()
+    try:
+        mid = int(message_id.strip())
+    except ValueError:
+        return await interaction.response.send_message("Invalid message ID.", ephemeral=True)
+    btn = await db.fetchone(
+        "SELECT id FROM df_ticket_panel_buttons WHERE message_id = ? AND label = ?",
+        (mid, button_label),
+    )
+    if not btn:
+        return await interaction.response.send_message(
+            f"No button labelled **{button_label}** on that panel.", ephemeral=True
+        )
+    if field_type == "dropdown" and not (dropdown_options and dropdown_options.strip()):
+        return await interaction.response.send_message(
+            "Dropdown fields need `dropdown_options` (choices separated by `|`).", ephemeral=True
+        )
+    if field_type in ("short", "long"):
+        tcount = await db.fetchone(
+            "SELECT COUNT(*) AS c FROM df_ticket_panel_fields WHERE button_id = ? AND field_type IN ('short','long')",
+            (btn["id"],),
+        )
+        if tcount and int(tcount["c"]) >= 5:
+            return await interaction.response.send_message(
+                "Max 5 short/long fields per button (Discord modal limit).", ephemeral=True
+            )
+    if field_type == "dropdown":
+        dcount = await db.fetchone(
+            "SELECT COUNT(*) AS c FROM df_ticket_panel_fields WHERE button_id = ? AND field_type = 'dropdown'",
+            (btn["id"],),
+        )
+        if dcount and int(dcount["c"]) >= 5:
+            return await interaction.response.send_message("Max 5 dropdowns per button.", ephemeral=True)
+    order = await db.fetchone(
+        "SELECT COUNT(*) AS c FROM df_ticket_panel_fields WHERE button_id = ?", (btn["id"],)
+    )
+    await db.execute(
+        "INSERT INTO df_ticket_panel_fields (button_id, field_type, label, options, required, sort_order) VALUES (?,?,?,?,?,?)",
+        (
+            btn["id"],
+            field_type,
+            field_label[:45],
+            (dropdown_options or "").strip() if field_type == "dropdown" else None,
+            1 if required else 0,
+            int(order["c"]) if order else 0,
+        ),
+    )
+    await interaction.response.send_message(
+        f"✅ Added **{field_type}** field `{field_label}` to button **{button_label}**.",
+        ephemeral=True,
+    )
+
+
+@ticketpanel_group.command(name="remove_button", description="Staff: remove a button from a ticket panel.")
+@app_commands.describe(message_id="Panel message ID", button_label="Button label to remove")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_remove_button_cmd(interaction: discord.Interaction, message_id: str, button_label: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Server only.", ephemeral=True)
+    await _ticket_panel_schema()
+    try:
+        mid = int(message_id.strip())
+    except ValueError:
+        return await interaction.response.send_message("Invalid message ID.", ephemeral=True)
+    btn = await db.fetchone(
+        "SELECT id FROM df_ticket_panel_buttons WHERE message_id = ? AND label = ?",
+        (mid, button_label),
+    )
+    if not btn:
+        return await interaction.response.send_message("Button not found.", ephemeral=True)
+    await db.execute("DELETE FROM df_ticket_panel_fields WHERE button_id = ?", (btn["id"],))
+    await db.execute("DELETE FROM df_ticket_panel_buttons WHERE id = ?", (btn["id"],))
+    panel = await db.fetchone("SELECT channel_id FROM df_ticket_panels WHERE message_id = ?", (mid,))
+    if panel:
+        channel = interaction.guild.get_channel(int(panel["channel_id"]))
+        if isinstance(channel, discord.TextChannel):
+            await _refresh_panel_message(mid, channel)
+    await interaction.response.send_message(f"🗑️ Removed button **{button_label}**.", ephemeral=True)
+
+
+@bot.listen("on_ready")
+async def restore_ticket_control_views():
+    try:
+        bot.add_view(TicketControlsView())
+        bot.add_view(TicketAssistantView())
+        log.info("Registered persistent ticket control/assistant views")
+    except Exception:
+        log.exception("Ticket control view restore failed")
+
+
+@bot.listen("on_ready")
+async def restore_ticket_panels():
+    try:
+        await _ticket_panel_schema()
+        panels = await db.fetchall("SELECT message_id FROM df_ticket_panels")
+        for row in panels:
+            view = await _build_panel_view(int(row["message_id"]))
+            bot.add_view(view, message_id=int(row["message_id"]))
+        if panels:
+            log.info("Restored %d ticket panel view(s)", len(panels))
+    except Exception:
+        log.exception("Ticket panel restore failed")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
