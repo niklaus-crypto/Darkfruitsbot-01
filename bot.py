@@ -71,7 +71,7 @@ DARK_FRUITS_PURPLE = discord.Color.from_rgb(114, 53, 219)
 SERVER_NAME = "Dark Fruits"
 THUMBNAIL_URL = os.environ.get(
     "THUMBNAIL_URL",
-    "https://cdn.discordapp.com/attachments/1490351057329590404/1560993894018322442/IMG_1033.jpg",
+    "https://media1.tenor.com/m/gzUrqiF-rVMAAAAd/blox-fruits.gif",
 )
 STAFF_ROLE_ID = int(os.environ.get("STAFF_ROLE_ID", "1492296310785835179"))
 QUEST_CHANNEL_ID = int(os.environ.get("QUEST_CHANNEL_ID", "1555732644397064313"))
@@ -977,6 +977,12 @@ class DynamicGiveawayView(discord.ui.View):
 
         user_id = interaction.user.id
 
+        if not msg_id or msg_id not in giveaways.active:
+            await interaction.response.send_message(
+                "❌ This giveaway is no longer active.", ephemeral=True
+            )
+            return
+
         if user_id in BLACKLISTED_USERS:
             await interaction.response.send_message(
                 "❌ You are blacklisted from giveaways.", ephemeral=True
@@ -1078,7 +1084,11 @@ class StoreBuyButton(discord.ui.Button):
         await add_inventory_item(user_id, self.item_name, 1)
         ticket_count = None
         if self.item_key == "giveaway_entry":
-            ticket_count = await grant_giveaway_ticket(interaction.guild, interaction.user)
+            try:
+                ticket_count = await grant_giveaway_ticket(interaction.guild, interaction.user)
+            except Exception:
+                log.exception("grant_giveaway_ticket failed for user %s", user_id)
+                ticket_count = 0
         embed = discord.Embed(
             title="🛍️ Purchase Successful",
             description=(
@@ -1099,7 +1109,7 @@ class StoreBuyButton(discord.ui.Button):
 class StoreView(discord.ui.View):
     def __init__(self, items: list[tuple]):
         super().__init__(timeout=300)
-        for item_key, name, price, _desc in items:
+        for item_key, name, price, _desc in items[:25]:
             self.add_item(StoreBuyButton(item_key, name, price))
 
 
@@ -2825,24 +2835,29 @@ async def claim_daily_role_cmd(interaction: discord.Interaction):
 @check_channel_restriction()
 async def store_cmd(interaction: discord.Interaction):
     rows = await db.fetchall(
-        "SELECT item_key, name, price, description FROM custom_store_items"
+        "SELECT item_key, name, price, description FROM custom_store_items ORDER BY price ASC"
     )
     embed = discord.Embed(
         title="Store",
-        description="Click a button to buy, or use `/buy`. Details: `/item_info` if available.",
+        description="Click a price button to buy, or use `/buy item_key:…`.",
         color=DARK_FRUITS_PURPLE,
     )
     embed.set_thumbnail(url=THUMBNAIL_URL)
     if not rows:
         embed.add_field(name="Empty", value="Staff can add items with `/add_store_item`.")
     else:
-        for r in rows:
+        # Discord allows max 25 fields; keep listings safe
+        for r in rows[:25]:
+            desc = (r["description"] or "")[:200]
             embed.add_field(
-                name=r["name"],
-                value=f"{r['description']}\n🏷️ `🪙 {r['price']:,}` · key `{r['item_key']}`",
+                name=str(r["name"])[:256],
+                value=f"{desc}\n🏷️ `🪙 {r['price']:,}` · key `{r['item_key']}`",
                 inline=False,
             )
-    view = StoreView([(r["item_key"], r["name"], r["price"], r["description"]) for r in rows])
+        if len(rows) > 25:
+            embed.set_footer(text=f"Showing 25 of {len(rows)} items — use /buy with the item key")
+    # Discord allows max 25 components (5 rows x 5); StoreBuyButton is one each
+    view = StoreView([(r["item_key"], r["name"], r["price"], r["description"]) for r in rows[:25]])
     await interaction.response.send_message(embed=embed, view=view)
 
 
@@ -2867,7 +2882,11 @@ async def buy_cmd(interaction: discord.Interaction, item_key: str):
     await add_inventory_item(interaction.user.id, row["name"], 1)
     ticket_count = None
     if item_key == "giveaway_entry":
-        ticket_count = await grant_giveaway_ticket(interaction.guild, interaction.user)
+        try:
+            ticket_count = await grant_giveaway_ticket(interaction.guild, interaction.user)
+        except Exception:
+            log.exception("grant_giveaway_ticket failed for user %s", interaction.user.id)
+            ticket_count = 0
     description = f"**{row['name']}** for `🪙 {row['price']:,}`."
     if ticket_count is not None:
         description += f"\n🎟️ You now have **{ticket_count} unused giveaway ticket(s)** saved. Your giveaway ticket role has been assigned."
@@ -3146,11 +3165,13 @@ async def approve_quest_cmd(
         return
     await update_user_balance(member.id, amount)
     data = await get_user_data(member.id)
-    new_q = data["quests_completed"] + 1
+    new_q = int(data["quests_completed"] or 0) + 1
     await db.execute(
         """INSERT INTO user_wallets (user_id, balance, tournaments_won, quests_completed)
            VALUES (?, ?, ?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET quests_completed = excluded.quests_completed""",
+           ON CONFLICT(user_id) DO UPDATE SET
+             quests_completed = excluded.quests_completed,
+             balance = excluded.balance""",
         (member.id, data["balance"], data["tournaments_won"], new_q),
     )
     try:
