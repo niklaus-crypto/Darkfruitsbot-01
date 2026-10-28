@@ -5191,30 +5191,7 @@ tickets_group = app_commands.Group(name="tickets", description="Support ticket a
 bot.tree.add_command(tickets_group)
 
 
-@tickets_group.command(name="open", description="Open a private support ticket.")
-@app_commands.describe(topic="Briefly describe what you need help with")
-async def community_ticket_open(interaction: discord.Interaction, topic: str = "General support"):
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return await interaction.response.send_message("Use this inside a server.", ephemeral=True)
-    await _ensure_community_schema()
-    existing = await db.fetchone("SELECT channel_id FROM df_tickets WHERE guild_id = ? AND opener_id = ? AND closed_at IS NULL", (interaction.guild.id, interaction.user.id))
-    if existing:
-        channel = interaction.guild.get_channel(int(existing["channel_id"]))
-        if channel:
-            return await interaction.response.send_message(f"You already have an open ticket: {channel.mention}", ephemeral=True)
-    category_id = int(os.environ.get("TICKET_CATEGORY_ID", "0") or 0)
-    category = interaction.guild.get_channel(category_id) if category_id else None
-    overwrites = {interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True), interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)}
-    staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
-    if staff_role:
-        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    safe_name = re.sub(r"[^a-z0-9-]", "", interaction.user.name.lower().replace(" ", "-"))[:18] or str(interaction.user.id)
-    channel = await interaction.guild.create_text_channel(f"ticket-{safe_name}", category=category if isinstance(category, discord.CategoryChannel) else None, overwrites=overwrites, topic=f"Ticket opener={interaction.user.id}; topic={topic[:150]}", reason=f"Support ticket opened by {interaction.user}")
-    await db.execute("INSERT INTO df_tickets (channel_id,guild_id,opener_id,opened_at,closed_at,claimed_by) VALUES (?,?,?,?,NULL,NULL)", (channel.id, interaction.guild.id, interaction.user.id, datetime.datetime.now(datetime.timezone.utc).isoformat()))
-    embed = _suite_embed("🎫 Dark Fruits Support Ticket", f"Welcome {interaction.user.mention}!\n\n**Topic:** {topic[:500]}\nPlease explain the issue and wait for a staff member. Do not share passwords or private account details.")
-    await channel.send(content=f"{interaction.user.mention} {staff_role.mention if staff_role else ''}", embed=embed, allowed_mentions=discord.AllowedMentions(users=True, roles=bool(staff_role)))
-    await interaction.response.send_message(f"✅ Your private ticket is ready: {channel.mention}", ephemeral=True)
-
+# Tickets are opened only via /ticketpanel buttons (no /tickets open).
 
 @tickets_group.command(name="claim", description="Claim the current support ticket (staff only).")
 @app_commands.checks.has_permissions(manage_channels=True)
@@ -6219,16 +6196,19 @@ async def _create_ticket_channel(
         (channel.id, ticket_no, topic[:200]),
     )
 
+
+    welcome_desc = (
+        "Welcome " + opener.mention + "! 👋\n\n"
+        "**Ticket type:** " + str(topic) + "\n"
+        "**What to do:** Tell us what is going on in your own words — screenshots help a lot.\n\n"
+        "🤖 **" + SERVER_NAME + " Assistant** will help first.\n"
+        "Need a human? Press **Remind Staff** on the panel below.\n\n"
+        "> 🔔 Staff is **not** pinged automatically when a ticket opens.\n"
+        "> Buttons on this message: 🔒 **Close** · 📝 **Close with Reason** · ✅ **Claim**"
+    )
     welcome = discord.Embed(
         title=f"📩 Ticket #{ticket_no} • {topic}",
-        description=(
-            f"Welcome {opener.mention}!\n\n"
-            f"**Ticket type:** {topic}\n"
-            f"**What to do:** Explain clearly why you opened this ticket and include any useful information.\n\n"
-            f"**{SERVER_NAME} Assistant will help first.**\n"
-            f"If you need an actual staff member, press **Remind Staff** on the Assistant panel.\n\n"
-            f"> Staff is not pinged automatically when a ticket opens."
-        ),
+        description=welcome_desc,
         color=DARK_FRUITS_PURPLE,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
@@ -6241,22 +6221,22 @@ async def _create_ticket_channel(
     await channel.send(content=opener.mention, embed=welcome, view=controls)
     bot.add_view(controls)
 
+    assistant_desc = (
+        "**Your ticket is open** — you are in the right place.\n\n"
+        "> I will try to help with common server questions while you wait.\n\n"
+        "**Want to ask me something?**\n"
+        "Just **type normally** in this channel. No need to @ me.\n"
+        "I only auto-reply to the person who opened the ticket.\n\n"
+        "**Need a real staff member?**\n"
+        "Press 🔔 **Remind Staff** and I will ping the team once.\n"
+        "New tickets do not ping staff automatically — no double spam.\n\n"
+        "After staff is reminded or someone **Claims**, I stay quiet "
+        "unless you @ me.\n\n"
+        "📌 Not sure what to send? Press **What Do I Send?** for a quick checklist."
+    )
     assistant = discord.Embed(
         title="🤖 Hey! I can help here first",
-        description=(
-            "**Your ticket is open.**\n\n"
-            "> I can help with the normal server parts of your question while this ticket is open.\n\n"
-            "**Want to ask me something?**\n"
-            "Just **type normally in this ticket**. You do not need to ping me while the ticket is waiting for staff.\n"
-            "I will automatically answer messages from the person who opened the ticket.\n\n"
-            "**Need an actual staff member?**\n"
-            "Press 🔔 **Remind Staff** below and I will ping Staff Team for you.\n"
-            "New tickets do **not** ping staff automatically, so nobody gets spammed twice.\n\n"
-            "Once Staff Team is reminded or a staff member claims the ticket, I stay quiet "
-            "unless the ticket owner pings me.\n\n"
-            "📌 **Not sure what to send?**\n"
-            "Press **What Do I Send?** for a checklist made for this ticket type."
-        ),
+        description=assistant_desc,
         color=DARK_FRUITS_PURPLE,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
@@ -6268,9 +6248,10 @@ async def _create_ticket_channel(
     return channel
 
 
+
 class TicketFormModal(discord.ui.Modal):
     def __init__(self, button_id: int, topic: str, text_fields: list, dropdown_answers: dict[str, str]):
-        super().__init__(title=topic[:45] or "Support ticket")
+        super().__init__(title=(topic[:40] or "Support ticket") if len(topic or "") <= 40 else "Please answer below")
         self.button_id = button_id
         self.topic = topic
         self.text_fields = text_fields
@@ -6278,11 +6259,15 @@ class TicketFormModal(discord.ui.Modal):
         self._inputs: list[discord.ui.TextInput] = []
         for field in text_fields[:5]:
             style = discord.TextStyle.paragraph if field["field_type"] == "long" else discord.TextStyle.short
+            placeholder = "Type your message here..."
+            if field["field_type"] == "short":
+                placeholder = "Short answer..."
             ti = discord.ui.TextInput(
                 label=field["label"][:45],
                 style=style,
                 required=bool(field.get("required", 1)),
-                max_length=1000 if field["field_type"] == "long" else 200,
+                max_length=1000 if field["field_type"] == "long" else 500,
+                placeholder=placeholder,
             )
             self._inputs.append(ti)
             self.add_item(ti)
@@ -6307,7 +6292,11 @@ class TicketFormModal(discord.ui.Modal):
         await interaction.response.defer(ephemeral=True)
         try:
             channel = await _create_ticket_channel(interaction.guild, interaction.user, self.topic, answers)
-            await interaction.followup.send(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+            await interaction.followup.send(
+                f"✅ Ticket created: {channel.mention}\n"
+                f"You'll find **Close**, **Claim**, and **Remind Staff** inside.",
+                ephemeral=True,
+            )
         except Exception as e:
             log.exception("Ticket create failed")
             await interaction.followup.send(f"❌ Could not create ticket: {e}", ephemeral=True)
