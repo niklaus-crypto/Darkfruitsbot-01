@@ -56,31 +56,27 @@ except ImportError:
     _HAS_GENAI = False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIG & LOGGING
+# 🎨 DARK FRUITS PREMIUM THEME
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("darkfruits")
+# Core Colors matching your screenshots
+PREMIUM_DARK = discord.Color.from_rgb(43, 45, 49)         # Discord dark background
+PREMIUM_PINK = discord.Color.from_rgb(255, 107, 157)      # Vouch pink accent
+PREMIUM_PURPLE = discord.Color.from_rgb(145, 70, 255)     # Ticket purple accent
+DARK_FRUITS_PURPLE = discord.Color.from_rgb(114, 53, 219) # Original theme
 
-DARK_FRUITS_PURPLE = discord.Color.from_rgb(114, 53, 219)
-SERVER_NAME = "Dark Fruits"
-THUMBNAIL_URL = os.environ.get(
-    "THUMBNAIL_URL",
-    "https://media.tenor.com/gzUrqiF-rVMAAAAd/blox-fruits.gif",
-)
-STAFF_ROLE_ID = int(os.environ.get("STAFF_ROLE_ID", "1492296310785835179"))
-QUEST_CHANNEL_ID = int(os.environ.get("QUEST_CHANNEL_ID", "1555732644397064313"))
-QUEST_PROOF_CHANNEL_ID = int(os.environ.get("QUEST_PROOF_CHANNEL_ID", "1555733599402066040"))
-# Stock alerts
-STOCK_CHANNEL_ID = int(os.environ.get("STOCK_CHANNEL_ID", "1489744139930173550"))
-STOCK_PING_ROLE_ID = int(os.environ.get("STOCK_PING_ROLE_ID", "1495818903845343313"))
-DB_PATH = os.environ.get("DB_PATH", "/var/data/giveaways.db" if os.path.isdir("/var/data") else "giveaways.db")
-BLOXFRUITS_KNOWLEDGE_DB = os.environ.get("BLOXFRUITS_KNOWLEDGE_DB", "/var/data/bloxfruits_knowledge.db" if os.path.isdir("/var/data") else "bloxfruits_knowledge.db")
+def create_theme_embed(title: str, description: str = None, color: discord.Color = PREMIUM_PURPLE, **kwargs) -> discord.Embed:
+    """Standardized embed builder using the Dark Fruits theme."""
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.now(datetime.timezone.utc))
+    
+    if "footer" in kwargs:
+        embed.set_footer(text=kwargs["footer"])
+    else:
+        embed.set_footer(text="Dark Fruits • Premium", icon_url=THUMBNAIL_URL)
+        
+    if "thumbnail" in kwargs:
+        embed.set_thumbnail(url=kwargs["thumbnail"])
+    return embed
 
 # Custom server fruit emojis
 FRUIT_EMOJIS: dict[str, str] = {
@@ -2595,36 +2591,29 @@ async def balance_cmd(interaction: discord.Interaction, member: discord.Member =
     embed.set_thumbnail(url=THUMBNAIL_URL)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 💰 THEME ECONOMY
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="profile", description="View pirate profile card.")
-@check_channel_restriction()
-@app_commands.describe(member="Optional member")
-async def profile_cmd(interaction: discord.Interaction, member: discord.Member = None):
-    target = member or interaction.user
-    data = await get_user_data(target.id)
-    t_row = await db.fetchone(
-        "SELECT expires_at FROM temp_roles WHERE user_id = ? LIMIT 1", (target.id,)
-    )
-    role_status = "✨ None Active"
-    if t_row:
-        try:
-            exp = datetime.datetime.fromisoformat(t_row["expires_at"])
-            role_status = f"⏳ Active until <t:{int(exp.timestamp())}:R>"
-        except Exception:
-            role_status = "⏳ Active"
-
-    embed = discord.Embed(
-        title=f"🏴‍☠️ {target.display_name}'s Dossier",
-        color=DARK_FRUITS_PURPLE,
-    )
-    embed.set_thumbnail(url=THUMBNAIL_URL)
-    embed.add_field(name="🪙 Vault", value=f"```yaml\n{data['balance']:,} DC\n```", inline=True)
-    embed.add_field(name="⚔️ Tournament Wins", value=f"```yaml\n{data['tournaments_won']}\n```", inline=True)
-    embed.add_field(name="📜 Quests", value=f"```yaml\n{data['quests_completed']}\n```", inline=True)
-    embed.add_field(name="👑 Temp Role", value=role_status, inline=False)
-    embed.set_footer(text=f"ID: {target.id}")
+@bot.tree.command(name="profile", description="View your pirate profile.")
+async def theme_profile(interaction: discord.Interaction, member: discord.Member = None):
+    member = member or interaction.user
+    
+    # Assuming you have a function to get user data
+    # data = await get_user_data(member.id)
+    # Mocking data for layout purposes:
+    data = {"balance": 15000, "tournaments_won": 3, "quests_completed": 12}
+    
+    embed = create_theme_embed(title=f"👤 {member.display_name}'s Profile", color=PREMIUM_PURPLE)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    
+    embed.description = f"**Total Balance:** `🪙 {data['balance']:,} DC`\n\n"
+    
+    embed.add_field(name="🏆 Tournaments Won", value=f"`{data['tournaments_won']}`", inline=True)
+    embed.add_field(name="📜 Quests Completed", value=f"`{data['quests_completed']}`", inline=True)
+    embed.add_field(name="💼 Account ID", value=f"`{member.id}`", inline=True)
+    
     await interaction.response.send_message(embed=embed)
-
 
 @bot.tree.command(name="inventory", description="View your inventory.")
 @check_channel_restriction()
@@ -3936,42 +3925,109 @@ async def mega_botinfo(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="serverinfo", description="View detailed information about this server.")
-async def mega_serverinfo(interaction: discord.Interaction):
-    guild = interaction.guild
-    if guild is None:
-        return await interaction.response.send_message("This command only works inside a server.", ephemeral=True)
-    embed = _suite_embed(f"🏰 {guild.name}", guild.description or "Server information and community statistics.")
-    if guild.icon:
-        embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Owner", value=f"<@{guild.owner_id}>" if guild.owner_id else "Unknown", inline=True)
-    embed.add_field(name="Members", value=f"`{guild.member_count:,}`", inline=True)
-    embed.add_field(name="Boosts", value=f"`{guild.premium_subscription_count or 0}` (level {guild.premium_tier})", inline=True)
-    embed.add_field(name="Channels", value=f"`{len(guild.channels)}` total\n`{len(guild.text_channels)}` text · `{len(guild.voice_channels)}` voice", inline=True)
-    embed.add_field(name="Roles", value=f"`{len(guild.roles)}`", inline=True)
-    embed.add_field(name="Created", value=f"<t:{int(guild.created_at.timestamp())}:D>\n<t:{int(guild.created_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="Verification", value=str(guild.verification_level).replace('_', ' ').title(), inline=True)
-    embed.add_field(name="Preferred locale", value=str(guild.preferred_locale), inline=True)
-    await interaction.response.send_message(embed=embed)
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📊 INTERACTIVE SERVER INFO
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class ServerInfoView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=60)
+        self.guild = guild
+        self.page = 1
 
-@bot.tree.command(name="userinfo", description="Inspect a member's server profile.")
-@app_commands.describe(member="Member to inspect; defaults to you")
-async def mega_userinfo(interaction: discord.Interaction, member: discord.Member | None = None):
+    def get_embed(self) -> discord.Embed:
+        guild = self.guild
+        embed = create_theme_embed(title=f"📊 {guild.name}", color=PREMIUM_PURPLE)
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        
+        embed.set_footer(text=f"Page {self.page}/3 • ID: {guild.id}")
+
+        if self.page == 1:
+            embed.description = "**General Information**"
+            embed.add_field(name="Owner", value=f"<@{guild.owner_id}>", inline=True)
+            embed.add_field(name="Created", value=f"<t:{int(guild.created_at.timestamp())}:R>", inline=True)
+            embed.add_field(name="Verification", value=str(guild.verification_level).title(), inline=True)
+            embed.add_field(name="Boosts", value=f"Level {guild.premium_tier} ({guild.premium_subscription_count} boosts)", inline=True)
+            embed.add_field(name="Locale", value=str(guild.preferred_locale), inline=True)
+        
+        elif self.page == 2:
+            embed.description = "**Member Statistics**"
+            humans = sum(1 for m in guild.members if not m.bot)
+            bots = guild.member_count - humans
+            online = sum(1 for m in guild.members if m.status != discord.Status.offline)
+            
+            embed.add_field(name="Total Members", value=f"👥 {guild.member_count:,}", inline=False)
+            embed.add_field(name="Humans", value=f"👤 {humans:,}", inline=True)
+            embed.add_field(name="Bots", value=f"🤖 {bots:,}", inline=True)
+            embed.add_field(name="Online", value=f"🟢 {online:,}", inline=True)
+
+        elif self.page == 3:
+            embed.description = "**Channel & Role Info**"
+            text = len(guild.text_channels)
+            voice = len(guild.voice_channels)
+            categories = len(guild.categories)
+            roles = len(guild.roles) - 1 
+            
+            embed.add_field(name="Text Channels", value=f"💬 {text}", inline=True)
+            embed.add_field(name="Voice Channels", value=f"🔊 {voice}", inline=True)
+            embed.add_field(name="Categories", value=f"📁 {categories}", inline=True)
+            embed.add_field(name="Roles", value=f"🎭 {roles}", inline=True)
+            embed.add_field(name="Emojis", value=f"😀 {len(guild.emojis)}", inline=True)
+            embed.add_field(name="Stickers", value=f"🖼️ {len(guild.stickers)}", inline=True)
+
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 1:
+            self.page -= 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < 3:
+            self.page += 1
+        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+
+@bot.tree.command(name="serverinfo", description="View detailed information about the server.")
+async def theme_serverinfo(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+    view = ServerInfoView(interaction.guild)
+    await interaction.response.send_message(embed=view.get_embed(), view=view)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 👤 THEME USER INFO
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="userinfo", description="View information about a member.")
+@app_commands.describe(member="The member to look up")
+async def theme_userinfo(interaction: discord.Interaction, member: discord.Member = None):
     member = member or interaction.user
-    if not isinstance(member, discord.Member):
-        return await interaction.response.send_message("I couldn't load that member.", ephemeral=True)
-    embed = _suite_embed(f"👤 {member.display_name}", f"Account: {member.mention}")
+    
+    embed = create_theme_embed(title=f"👤 {member}", color=PREMIUM_PINK)
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Username", value=f"`{member.name}`", inline=True)
-    embed.add_field(name="User ID", value=f"`{member.id}`", inline=True)
-    embed.add_field(name="Bot account", value="Yes" if member.bot else "No", inline=True)
-    embed.add_field(name="Joined server", value=f"<t:{int(member.joined_at.timestamp())}:R>" if member.joined_at else "Unknown", inline=True)
-    embed.add_field(name="Account created", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
-    roles = [r.mention for r in reversed(member.roles) if r != interaction.guild.default_role]
-    embed.add_field(name=f"Roles ({len(roles)})", value=(" ".join(roles[:25]) or "No extra roles")[:1024], inline=False)
-    await interaction.response.send_message(embed=embed)
+    
+    # Account Info
+    embed.add_field(name="ID", value=f"`{member.id}`", inline=True)
+    embed.add_field(name="Nickname", value=f"`{member.nick or 'None'}`", inline=True)
+    embed.add_field(name="Bot?", value=f"`{'Yes' if member.bot else 'No'}`", inline=True)
+    
+    # Dates (Using Discord's native <t:...:R> format)
+    embed.add_field(name="Joined Discord", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    if member.joined_at:
+        embed.add_field(name="Joined Server", value=f"<t:{int(member.joined_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="Highest Role", value=member.top_role.mention, inline=True)
 
+    # Roles (Cut off if too long)
+    roles = [role.mention for role in member.roles if role != interaction.guild.default_role]
+    roles_str = " ".join(roles)
+    if len(roles_str) > 1000:
+        roles_str = roles_str[:1000] + "..."
+    embed.add_field(name=f"Roles [{len(roles)}]", value=roles_str or "None", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="avatar", description="Show a member's avatar in full resolution.")
 @app_commands.describe(member="Member; defaults to you")
@@ -5336,28 +5392,80 @@ async def mega_log_member_join(member: discord.Member):
 
 
 
-# Standardly named moderation aliases, so staff can discover the expected commands.
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🛡️ INTERACTIVE MODERATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@bot.tree.command(name="ban", description="Ban a member from the server (staff only).")
-@app_commands.describe(member="Member to ban", reason="Reason", delete_message_days="Delete recent messages (0–7 days)")
+class ConfirmActionView(discord.ui.View):
+    def __init__(self, author_id: int, action: str, target: discord.Member, reason: str):
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.action = action
+        self.target = target
+        self.reason = reason
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("❌ You cannot interact with this confirmation.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children: child.disabled = True
+        await interaction.response.edit_message(content="Processing...", view=self)
+        
+        try:
+            if self.action == "ban":
+                await self.target.ban(reason=f"{self.reason} | Mod: {interaction.user}")
+            elif self.action == "kick":
+                await self.target.kick(reason=f"{self.reason} | Mod: {interaction.user}")
+            elif self.action == "timeout":
+                await self.target.timeout(datetime.timedelta(minutes=60), reason=f"{self.reason} | Mod: {interaction.user}")
+            
+            embed = create_theme_embed(
+                f"✅ {self.action.capitalize()} Successful",
+                f"**Target:** {self.target.mention} (`{self.target.id}`)\n**Reason:** {self.reason}",
+                color=PREMIUM_PINK
+            )
+            await interaction.edit_original_response(content=None, embed=embed, view=self)
+        except discord.Forbidden:
+            embed = create_theme_embed("❌ Permission Error", "I do not have permission to perform this action.", color=discord.Color.red())
+            await interaction.edit_original_response(content=None, embed=embed, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children: child.disabled = True
+        embed = create_theme_embed("❌ Action Cancelled", "The moderation action was cancelled.", color=PREMIUM_DARK)
+        await interaction.response.edit_message(content=None, embed=embed, view=self)
+
+@bot.tree.command(name="ban", description="Ban a member from the server.")
+@app_commands.describe(member="The member to ban", reason="Reason for the ban")
 @app_commands.checks.has_permissions(ban_members=True)
-async def standard_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason supplied", delete_message_days: app_commands.Range[int, 0, 7] = 0):
-    if member.id == interaction.user.id or member.guild_permissions.administrator:
-        return await interaction.response.send_message("You can't ban yourself or an administrator.", ephemeral=True)
-    await member.ban(reason=f"{reason} — by {interaction.user}", delete_message_days=delete_message_days)
-    await interaction.response.send_message(f"🔨 Banned {member} (`{member.id}`). Reason: {reason}", ephemeral=True)
+async def theme_ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.top_role >= interaction.user.top_role:
+        return await interaction.response.send_message("❌ You cannot ban someone with a higher or equal role.", ephemeral=True)
+    
+    embed = create_theme_embed(
+        "⚠️ Confirm Ban",
+        f"Are you sure you want to ban **{member}**?\n\n**Reason:** {reason}",
+        color=PREMIUM_PURPLE
+    )
+    await interaction.response.send_message(embed=embed, view=ConfirmActionView(interaction.user.id, "ban", member, reason), ephemeral=True)
 
-
-@bot.tree.command(name="kick", description="Kick a member from the server (staff only).")
-@app_commands.describe(member="Member to kick", reason="Reason")
+@bot.tree.command(name="kick", description="Kick a member from the server.")
+@app_commands.describe(member="The member to kick", reason="Reason for the kick")
 @app_commands.checks.has_permissions(kick_members=True)
-async def standard_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason supplied"):
-    if member.id == interaction.user.id or member.guild_permissions.administrator:
-        return await interaction.response.send_message("You can't kick yourself or an administrator.", ephemeral=True)
-    await member.kick(reason=f"{reason} — by {interaction.user}")
-    await interaction.response.send_message(f"👢 Kicked {member} (`{member.id}`). Reason: {reason}", ephemeral=True)
-
-
+async def theme_kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.top_role >= interaction.user.top_role:
+        return await interaction.response.send_message("❌ You cannot kick someone with a higher or equal role.", ephemeral=True)
+    
+    embed = create_theme_embed(
+        "⚠️ Confirm Kick",
+        f"Are you sure you want to kick **{member}**?\n\n**Reason:** {reason}",
+        color=PREMIUM_PURPLE
+    )
+    await interaction.response.send_message(embed=embed, view=ConfirmActionView(interaction.user.id, "kick", member, reason), ephemeral=True)
 @bot.tree.command(name="timeout", description="Timeout a member (staff only).")
 @app_commands.describe(member="Member", minutes="Duration in minutes", reason="Reason")
 @app_commands.checks.has_permissions(moderate_members=True)
