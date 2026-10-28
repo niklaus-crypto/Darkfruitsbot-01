@@ -299,10 +299,21 @@ class Database:
             finally:
                 await cur.close()
 
-    async def execute(self, sql: str, params: tuple = ()) -> aiosqlite.Cursor:
+    async def execute(self, sql: str, params: tuple = ()):
+        """Run a statement and return a small result with lastrowid/rowcount.
+
+        Important: the underlying cursor is closed when the lock is released, so we
+        must capture lastrowid/rowcount inside the context — callers that used
+        `cur.lastrowid` after `await db.execute(...)` were reading a closed cursor.
+        """
         async with self.cursor() as cur:
             await cur.execute(sql, params)
-            return cur
+            class _Result:
+                pass
+            result = _Result()
+            result.lastrowid = cur.lastrowid
+            result.rowcount = cur.rowcount
+            return result
 
     async def executemany(self, sql: str, seq) -> None:
         async with self.cursor() as cur:
@@ -735,6 +746,7 @@ def parse_duration(duration_str: str) -> int:
 
 
 def parse_extra_entries(text: str | None) -> dict:
+    """Parse role multipliers. Only numeric role IDs are accepted (mentions or bare IDs)."""
     multipliers: dict = {}
     if not text:
         return multipliers
@@ -742,14 +754,13 @@ def parse_extra_entries(text: str | None) -> dict:
         entry = entry.strip()
         if not entry:
             continue
-        match = re.search(r"(?:<@&?(\d+)>|([^\d\s]+))\s+(\d+)", entry)
+        # Accept <@&123> 5, <@123> 5, or 123 5 — never free-text role names
+        match = re.search(r"(?:<@&?(\d+)>|(\d+))\s+(\d+)", entry)
         if match:
-            target = match.group(1) or match.group(2)
+            rid = int(match.group(1) or match.group(2))
             val = int(match.group(3))
-            if target.isdigit():
-                multipliers[int(target)] = val
-            else:
-                multipliers[target] = val
+            if val >= 1:
+                multipliers[rid] = val
     return multipliers
 
 
@@ -1007,7 +1018,11 @@ class DynamicGiveawayView(discord.ui.View):
             bonus_entries = 0
             if interaction.guild:
                 try:
-                    bonus_row = await db.fetchone("SELECT entries FROM df_bonus_entries WHERE guild_id = ? AND user_id = ?", (interaction.guild.id, user_id))
+                    await _ensure_community_schema()
+                    bonus_row = await db.fetchone(
+                        "SELECT entries FROM df_bonus_entries WHERE guild_id = ? AND user_id = ?",
+                        (interaction.guild.id, user_id),
+                    )
                     bonus_entries = max(0, int(bonus_row["entries"])) if bonus_row else 0
                 except Exception:
                     bonus_entries = 0
@@ -1015,7 +1030,13 @@ class DynamicGiveawayView(discord.ui.View):
             view.entrants[user_id] = entry_count
             await giveaways.update_entrants(msg_id, view.entrants)
             if bonus_entries and interaction.guild:
-                await db.execute("UPDATE df_bonus_entries SET entries = MAX(0, entries - ?) WHERE guild_id = ? AND user_id = ?", (bonus_entries, interaction.guild.id, user_id))
+                try:
+                    await db.execute(
+                        "UPDATE df_bonus_entries SET entries = max(0, entries - ?) WHERE guild_id = ? AND user_id = ?",
+                        (bonus_entries, interaction.guild.id, user_id),
+                    )
+                except Exception:
+                    log.debug("Could not consume bonus entries for user %s", user_id, exc_info=True)
 
         giveaways.schedule_embed_update(msg_id, view)
 
@@ -3200,78 +3221,110 @@ async def _launch_giveaway(
         await interaction.response.send_message("❌ Invalid duration (s/m/h/d).", ephemeral=True)
         return
     target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ Choose a text channel for the giveaway.", ephemeral=True
+        )
+        return
+
     await interaction.response.send_message(
         f"🔮 Launching giveaway in {target.mention}...", ephemeral=True
     )
 
-    host = interaction.user
-    end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
-    ts = f"<t:{int(end_time.timestamp())}:R>"
-    role_multipliers = parse_extra_entries(extra_entries)
-    multi_desc = "".join(f"• <@&{rid}> → **{m}x**\n" for rid, m in role_multipliers.items())
+    try:
+        host = interaction.user
+        end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+        ts = f"<t:{int(end_time.timestamp())}:R>"
+        role_multipliers = parse_extra_entries(extra_entries)
+        # Only real role IDs (ints) — avoids @unknown-role in the embed
+        multi_desc = "".join(
+            f"• <@&{rid}> → **{m}x**\n"
+            for rid, m in role_multipliers.items()
+            if isinstance(rid, int)
+        )
 
-    if winners_count == 1 or not prize2:
-        title = "🎁  DARK FRUITS GIVEAWAY"
-        desc = f"### ✨ Prize: **{prize}**"
-        winner_text = "` 1 Lucky Winner `"
-    else:
-        title = "🥇🥈 DARK FRUITS SPLIT GIVEAWAY"
-        desc = f"### ✨ Dual Treasures:\n• 🥇 **{prize}**\n• 🥈 **{prize2}**"
-        winner_text = "` 2 Distinct Winners `"
+        if winners_count == 1 or not prize2:
+            title = "🎁  DARK FRUITS GIVEAWAY"
+            desc = f"### ✨ Prize: **{prize}**"
+            winner_text = "` 1 Lucky Winner `"
+        else:
+            title = "🥇🥈 DARK FRUITS SPLIT GIVEAWAY"
+            desc = f"### ✨ Dual Treasures:\n• 🥇 **{prize}**\n• 🥈 **{prize2}**"
+            winner_text = "` 2 Distinct Winners `"
 
-    embed = discord.Embed(title=title, description=desc, color=DARK_FRUITS_PURPLE)
-    embed.set_thumbnail(url=THUMBNAIL_URL)
-    embed.add_field(name="🏆 Winners", value=winner_text, inline=True)
-    embed.add_field(name="⏳ Time Remaining", value=ts, inline=True)
-    if required_role:
-        embed.add_field(name="🔒 Required Role", value=required_role.mention, inline=False)
-    if multi_desc:
-        embed.add_field(name="⚡ Multipliers", value=multi_desc, inline=False)
-    embed.add_field(
-        name="📊 Live Entry Stats",
-        value="🎟️ Total Tickets: `0`\n👥 Participants: `0 Users`",
-        inline=False,
-    )
-    if youtube_url:
+        embed = discord.Embed(title=title, description=desc, color=DARK_FRUITS_PURPLE)
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+        embed.add_field(name="🏆 Winners", value=winner_text, inline=True)
+        embed.add_field(name="⏳ Time Remaining", value=ts, inline=True)
+        if required_role:
+            embed.add_field(name="🔒 Required Role", value=required_role.mention, inline=False)
+        if multi_desc:
+            embed.add_field(name="⚡ Multipliers", value=multi_desc, inline=False)
         embed.add_field(
-            name="🔗 Task",
-            value=f"[YouTube]({youtube_url})",
+            name="📊 Live Entry Stats",
+            value="🎟️ Total Tickets: `0`\n👥 Participants: `0 Users`",
             inline=False,
         )
-    embed.set_footer(
-        text=f"Hosted by {host.display_name}",
-        icon_url=getattr(host.display_avatar, "url", THUMBNAIL_URL),
-    )
+        # Only add Task field when URL is a real http(s) link
+        clean_yt = (youtube_url or "").strip()
+        if clean_yt and not clean_yt.lower().startswith(("http://", "https://")):
+            clean_yt = "https://" + clean_yt
+        if clean_yt and re.match(r"^https?://\S+$", clean_yt, re.I):
+            embed.add_field(
+                name="🔗 Task",
+                value=f"[YouTube]({clean_yt})",
+                inline=False,
+            )
+        footer_icon = THUMBNAIL_URL
+        try:
+            footer_icon = host.display_avatar.url
+        except Exception:
+            pass
+        embed.set_footer(text=f"Hosted by {getattr(host, 'display_name', 'Staff')}", icon_url=footer_icon)
 
-    giveaway_msg = await target.send(content=content_prefix, embed=embed)
-    view = DynamicGiveawayView(
-        message_id=giveaway_msg.id,
-        embed=embed,
-        role_multipliers=role_multipliers,
-        required_role=required_role,
-    )
-    view.message_ref = giveaway_msg
-    await giveaway_msg.edit(view=view)
-    bot.add_view(view, message_id=giveaway_msg.id)
+        giveaway_msg = await target.send(
+            content=content_prefix,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False),
+        )
+        view = DynamicGiveawayView(
+            message_id=giveaway_msg.id,
+            embed=embed,
+            role_multipliers={k: v for k, v in role_multipliers.items() if isinstance(k, int)},
+            required_role=required_role,
+        )
+        view.message_ref = giveaway_msg
+        await giveaway_msg.edit(view=view)
+        bot.add_view(view, message_id=giveaway_msg.id)
 
-    data = {
-        "view": view,
-        "prize": prize,
-        "prize2": prize2,
-        "winners_count": winners_count,
-        "host_user": host,
-        "host_mention": host.mention,
-        "custom_end": custom_end,
-        "role_multipliers": role_multipliers,
-        "end_time": end_time,
-        "paused": False,
-        "remaining_seconds": seconds,
-        "channel": target,
-    }
-    async with giveaways.lock:
-        giveaways.active[giveaway_msg.id] = data
-    await giveaways.save(giveaway_msg.id, data)
-    bot.loop.create_task(run_giveaway_timer(giveaway_msg.id))
+        data = {
+            "view": view,
+            "prize": prize,
+            "prize2": prize2,
+            "winners_count": winners_count,
+            "host_user": host,
+            "host_mention": getattr(host, "mention", str(host)),
+            "custom_end": custom_end,
+            "role_multipliers": view.role_multipliers,
+            "end_time": end_time,
+            "paused": False,
+            "remaining_seconds": seconds,
+            "channel": target,
+        }
+        async with giveaways.lock:
+            giveaways.active[giveaway_msg.id] = data
+        await giveaways.save(giveaway_msg.id, data)
+        bot.loop.create_task(run_giveaway_timer(giveaway_msg.id))
+    except Exception as e:
+        log.exception("Giveaway launch failed after initial response: %s", e)
+        try:
+            await interaction.followup.send(
+                f"❌ Giveaway failed after starting: `{type(e).__name__}: {e}`\n"
+                "Check bot permissions (Send Messages, Embed Links, Mention Everyone) and that extra_entries uses real role mentions like `<@&ROLE_ID> 3`.",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
 
 
 @bot.tree.command(name="giveaway_single", description="Launch a single-prize giveaway.")
@@ -3381,77 +3434,86 @@ async def giveaway_schedule_cmd(
         await interaction.response.send_message("❌ Invalid start delay.", ephemeral=True)
         return
     target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        await interaction.response.send_message(
+            "❌ Choose a text channel for the scheduled giveaway.", ephemeral=True
+        )
+        return
     await interaction.response.send_message(
         f"⏱️ Scheduled **{prize}** in {target.mention} after **{start_in}**.",
         ephemeral=True,
     )
 
     async def delayed():
-        await asyncio.sleep(delay)
-        # Re-create a fake interaction-like launch is awkward; call internal launch
-        # by constructing minimal context via a synthetic path:
-        class _Fake:
-            user = interaction.user
-            channel = target
-            async def response(self):
-                pass
-        # Use a simplified launch without interaction.response
-        seconds = parse_duration(duration)
-        if seconds <= 0:
-            return
-        host = interaction.user
-        end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
-        ts = f"<t:{int(end_time.timestamp())}:R>"
-        role_multipliers = parse_extra_entries(extra_entries)
-        multi_desc = "".join(f"• <@&{rid}> → **{m}x**\n" for rid, m in role_multipliers.items())
-        embed = discord.Embed(
-            title="🎁  DARK FRUITS GIVEAWAY",
-            description=f"### ✨ Prize: **{prize}**",
-            color=DARK_FRUITS_PURPLE,
-        )
-        embed.set_thumbnail(url=THUMBNAIL_URL)
-        embed.add_field(name="🏆 Winners", value="` 1 Lucky Winner `", inline=True)
-        embed.add_field(name="⏳ Time Remaining", value=ts, inline=True)
-        if required_role:
-            embed.add_field(name="🔒 Required Role", value=required_role.mention, inline=False)
-        if multi_desc:
-            embed.add_field(name="⚡ Multipliers", value=multi_desc, inline=False)
-        embed.add_field(
-            name="📊 Live Entry Stats",
-            value="🎟️ Total Tickets: `0`\n👥 Participants: `0 Users`",
-            inline=False,
-        )
-        embed.set_footer(text=f"Hosted by {host.display_name}")
-        giveaway_msg = await target.send(
-            content="🔔 @everyone\n🎉 **SCHEDULED GIVEAWAY LIVE** 🎉", embed=embed
-        )
-        view = DynamicGiveawayView(
-            message_id=giveaway_msg.id,
-            embed=embed,
-            role_multipliers=role_multipliers,
-            required_role=required_role,
-        )
-        view.message_ref = giveaway_msg
-        await giveaway_msg.edit(view=view)
-        bot.add_view(view, message_id=giveaway_msg.id)
-        data = {
-            "view": view,
-            "prize": prize,
-            "prize2": None,
-            "winners_count": 1,
-            "host_user": host,
-            "host_mention": host.mention,
-            "custom_end": "Open a support ticket to claim your prize!",
-            "role_multipliers": role_multipliers,
-            "end_time": end_time,
-            "paused": False,
-            "remaining_seconds": seconds,
-            "channel": target,
-        }
-        async with giveaways.lock:
-            giveaways.active[giveaway_msg.id] = data
-        await giveaways.save(giveaway_msg.id, data)
-        bot.loop.create_task(run_giveaway_timer(giveaway_msg.id))
+        try:
+            await asyncio.sleep(delay)
+            if not isinstance(target, discord.TextChannel):
+                log.warning("Scheduled giveaway aborted: target is not a text channel")
+                return
+            seconds = parse_duration(duration)
+            if seconds <= 0:
+                log.warning("Scheduled giveaway aborted: invalid duration %r", duration)
+                return
+            host = interaction.user
+            end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
+            ts = f"<t:{int(end_time.timestamp())}:R>"
+            role_multipliers = {
+                k: v for k, v in parse_extra_entries(extra_entries).items() if isinstance(k, int)
+            }
+            multi_desc = "".join(f"• <@&{rid}> → **{m}x**\n" for rid, m in role_multipliers.items())
+            embed = discord.Embed(
+                title="🎁  DARK FRUITS GIVEAWAY",
+                description=f"### ✨ Prize: **{prize}**",
+                color=DARK_FRUITS_PURPLE,
+            )
+            embed.set_thumbnail(url=THUMBNAIL_URL)
+            embed.add_field(name="🏆 Winners", value="` 1 Lucky Winner `", inline=True)
+            embed.add_field(name="⏳ Time Remaining", value=ts, inline=True)
+            if required_role:
+                embed.add_field(name="🔒 Required Role", value=required_role.mention, inline=False)
+            if multi_desc:
+                embed.add_field(name="⚡ Multipliers", value=multi_desc, inline=False)
+            embed.add_field(
+                name="📊 Live Entry Stats",
+                value="🎟️ Total Tickets: `0`\n👥 Participants: `0 Users`",
+                inline=False,
+            )
+            embed.set_footer(text=f"Hosted by {getattr(host, 'display_name', 'Staff')}")
+            giveaway_msg = await target.send(
+                content="🔔 @everyone\n🎉 **SCHEDULED GIVEAWAY LIVE** 🎉",
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(everyone=True, roles=True, users=False),
+            )
+            view = DynamicGiveawayView(
+                message_id=giveaway_msg.id,
+                embed=embed,
+                role_multipliers=role_multipliers,
+                required_role=required_role,
+            )
+            view.message_ref = giveaway_msg
+            await giveaway_msg.edit(view=view)
+            bot.add_view(view, message_id=giveaway_msg.id)
+            data = {
+                "view": view,
+                "prize": prize,
+                "prize2": None,
+                "winners_count": 1,
+                "host_user": host,
+                "host_mention": getattr(host, "mention", str(host)),
+                "custom_end": "Open a support ticket to claim your prize!",
+                "role_multipliers": role_multipliers,
+                "end_time": end_time,
+                "paused": False,
+                "remaining_seconds": seconds,
+                "channel": target,
+            }
+            async with giveaways.lock:
+                giveaways.active[giveaway_msg.id] = data
+            await giveaways.save(giveaway_msg.id, data)
+            bot.loop.create_task(run_giveaway_timer(giveaway_msg.id))
+            log.info("Scheduled giveaway started: msg=%s prize=%s", giveaway_msg.id, prize)
+        except Exception:
+            log.exception("Scheduled giveaway failed (prize=%s channel=%s)", prize, getattr(target, "id", None))
 
     bot.loop.create_task(delayed())
 
@@ -3633,7 +3695,9 @@ async def edit_giveaway_cmd(
         if custom_end_message:
             data["custom_end"] = custom_end_message
         if extra_entries is not None:
-            data["role_multipliers"] = parse_extra_entries(extra_entries)
+            data["role_multipliers"] = {
+                k: v for k, v in parse_extra_entries(extra_entries).items() if isinstance(k, int)
+            }
             data["view"].role_multipliers = data["role_multipliers"]
         if new_duration:
             secs = parse_duration(new_duration)
@@ -3646,7 +3710,9 @@ async def edit_giveaway_cmd(
         total_t = sum(view.entrants.values())
         total_u = len(view.entrants)
         multi_desc = "".join(
-            f"• <@&{rid}> → **{m}x**\n" for rid, m in data["role_multipliers"].items()
+            f"• <@&{rid}> → **{m}x**\n"
+            for rid, m in data["role_multipliers"].items()
+            if isinstance(rid, int)
         )
         ts = f"<t:{int(data['end_time'].timestamp())}:R>"
         embed = discord.Embed(
@@ -4297,8 +4363,16 @@ async def mega_global_app_command_error(interaction: discord.Interaction, error:
     elif isinstance(error, app_commands.errors.TransformerError):
         message = "❌ One of those options couldn't be understood. Check the command inputs and try again."
     else:
-        log.error("Unhandled slash command error: %r", error)
-        message = "❌ Something went wrong while running that command. The error has been logged."
+        log.error("Unhandled slash command error: %r", error, exc_info=error)
+        # Surface a short, safe error hint so staff can fix config without digging logs
+        detail = f"{type(error).__name__}"
+        cause = getattr(error, "original", None) or error
+        if cause is not error:
+            detail = f"{detail} / {type(cause).__name__}: {cause}"
+        else:
+            detail = f"{detail}: {cause}"
+        detail = str(detail)[:180]
+        message = f"❌ Something went wrong while running that command.\n`{detail}`"
     try:
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
@@ -5192,16 +5266,49 @@ async def mega_setup_status(interaction: discord.Interaction):
 # CODE WATCHER + MONTHLY COMMUNITY LEADERBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def fetch_current_blox_codes() -> tuple[list[str], str]:
-    """Fetch code listings from community pages; never invent or hard-code active codes."""
+async def fetch_current_blox_codes() -> tuple[list[str], list[str], str]:
+    """Fetch active + expired Blox Fruits codes from community pages.
+
+    Returns (active_codes, expired_codes, source_label).
+    Never invents codes — only extracts what the source pages list.
+    """
     sources = [
         ("Pocket Tactics", "https://www.pockettactics.com/blox-fruits/codes"),
         ("Blox Fruits Wiki", "https://blox-fruits.fandom.com/wiki/Codes"),
     ]
     headers = {"User-Agent": "Mozilla/5.0 (compatible; DarkFruitsBot/2.0; +https://discord.com)"}
+    stop = {
+        "CODE", "CODES", "ACTIVE", "WORKING", "EXPIRED", "INACTIVE", "REWARD", "REWARDS",
+        "BLOX", "FRUITS", "UPDATE", "STATUS", "NEW", "OLD", "FREE", "STAT",
+    }
+    code_re = re.compile(r"\b([A-Z][A-Z0-9_]{2,30})\b")
+
+    def extract_codes(node) -> list[str]:
+        found: list[str] = []
+        if node is None:
+            return found
+        for cell in node.find_all(["code", "td", "li", "span", "p"]):
+            text_value = cell.get_text(" ", strip=True)
+            for match in code_re.finditer(text_value):
+                code = match.group(1)
+                if code not in stop and code not in found:
+                    found.append(code)
+        return found
+
+    def section_after_heading(soup, predicates) -> list:
+        nodes = []
+        for heading in soup.find_all(["h1", "h2", "h3", "h4"]):
+            heading_text = heading.get_text(" ", strip=True).lower()
+            if any(pred(heading_text) for pred in predicates):
+                sibling = heading.find_next(["table", "ul", "ol", "div"])
+                if sibling:
+                    nodes.append(sibling)
+        return nodes
+
     active: list[str] = []
+    expired: list[str] = []
     used_source = ""
-    timeout = aiohttp.ClientTimeout(total=10, connect=4)
+    timeout = aiohttp.ClientTimeout(total=12, connect=4)
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         for source_name, url in sources:
             try:
@@ -5210,67 +5317,140 @@ async def fetch_current_blox_codes() -> tuple[list[str], str]:
                         continue
                     html = await response.text(errors="ignore")
                 soup = BeautifulSoup(html, "html.parser")
-                # Prioritize explicit active/working sections when the page uses headings.
-                sections = []
-                for heading in soup.find_all(["h2", "h3"]):
-                    heading_text = heading.get_text(" ", strip=True).lower()
-                    if any(term in heading_text for term in ("active", "working", "currently working")) and not any(term in heading_text for term in ("expired", "inactive")):
-                        sibling = heading.find_next(["table", "ul", "ol"])
-                        if sibling:
-                            sections.append(sibling)
-                nodes = sections or soup.find_all(["table", "ul", "ol"])
-                candidates = []
-                for node in nodes:
-                    for cell in node.find_all(["code", "td", "li"]):
-                        text_value = cell.get_text(" ", strip=True)
-                        match = re.search(r"\b([A-Z][A-Z0-9_]{2,30})\b", text_value)
-                        if match:
-                            code = match.group(1)
-                            if code not in {"CODE", "CODES", "ACTIVE", "WORKING", "EXPIRED", "REWARD", "REWARDS", "BLOX", "FRUITS", "UPDATE"}:
-                                candidates.append(code)
-                candidates = list(dict.fromkeys(candidates))
-                if candidates:
-                    active = candidates[:40]
-                    used_source = f"{source_name} — {url}"
-                    break
+
+                active_nodes = section_after_heading(
+                    soup,
+                    [
+                        lambda t: any(x in t for x in ("active", "working", "currently working", "valid"))
+                        and not any(x in t for x in ("expired", "inactive", "invalid")),
+                    ],
+                )
+                expired_nodes = section_after_heading(
+                    soup,
+                    [
+                        lambda t: any(x in t for x in ("expired", "inactive", "invalid", "old codes")),
+                    ],
+                )
+
+                page_active: list[str] = []
+                page_expired: list[str] = []
+                for node in active_nodes:
+                    for code in extract_codes(node):
+                        if code not in page_active:
+                            page_active.append(code)
+                for node in expired_nodes:
+                    for code in extract_codes(node):
+                        if code not in page_expired and code not in page_active:
+                            page_expired.append(code)
+
+                # Fallback: whole-page scrape if section headings were not found
+                if not page_active and not page_expired:
+                    for node in soup.find_all(["table", "ul", "ol"]):
+                        for code in extract_codes(node):
+                            if code not in page_active:
+                                page_active.append(code)
+
+                if page_active or page_expired:
+                    # Prefer the first source that actually has structured lists
+                    if not active and not expired:
+                        active = page_active[:60]
+                        expired = page_expired[:80]
+                        used_source = f"{source_name} — {url}"
+                    # If primary source had active but no expired, fill expired from next source
+                    elif not expired and page_expired:
+                        expired = page_expired[:80]
+                        used_source = f"{used_source}; expired from {source_name}"
+                    if active and expired:
+                        break
             except Exception as exc:
                 log.debug("Code source %s unavailable: %s", source_name, exc)
-    return active, used_source
+
+    # Never list a code as both
+    expired = [c for c in expired if c not in set(active)]
+    return active, expired, used_source
 
 
-@bot.tree.command(name="codes", description="Fetch a current community list of Blox Fruits codes.")
+def _codes_field_chunks(title_prefix: str, codes: list[str], emoji: str, limit: int = 45) -> list[tuple[str, str]]:
+    """Split a long code list into embed field-sized chunks (1024 char limit)."""
+    if not codes:
+        return [(f"{emoji} {title_prefix} (0)", "_None listed by the source right now._")]
+    lines = [f"`{c}`" for c in codes[:limit]]
+    fields: list[tuple[str, str]] = []
+    chunk: list[str] = []
+    part = 1
+    for line in lines:
+        trial = "\n".join(chunk + [line])
+        if len(trial) > 1000 and chunk:
+            label = f"{emoji} {title_prefix} ({len(codes)})" if part == 1 else f"{emoji} {title_prefix} (cont. {part})"
+            fields.append((label, "\n".join(chunk)))
+            chunk = [line]
+            part += 1
+        else:
+            chunk.append(line)
+    if chunk:
+        label = f"{emoji} {title_prefix} ({len(codes)})" if part == 1 else f"{emoji} {title_prefix} (cont. {part})"
+        fields.append((label, "\n".join(chunk)))
+    return fields
+
+
+@bot.tree.command(name="codes", description="Show active and expired Blox Fruits codes from community sources.")
 async def mega_codes(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True, ephemeral=True)
-    codes, source = await fetch_current_blox_codes()
-    if not codes:
-        return await interaction.followup.send("⚠️ I couldn't verify a current code list right now. Check the linked sources directly: https://www.pockettactics.com/blox-fruits/codes and https://blox-fruits.fandom.com/wiki/Codes", ephemeral=True)
-    embed = _suite_embed("🎟️ Blox Fruits • Code check", "These codes were extracted from a community-maintained page. Roblox may expire codes at any time; try them in-game and treat the source as unofficial.")
-    embed.add_field(name=f"Codes found ({len(codes)})", value="\n".join(f"`{code}`" for code in codes[:30])[:1024], inline=False)
-    embed.add_field(name="Source", value=source, inline=False)
+    active, expired, source = await fetch_current_blox_codes()
+    if not active and not expired:
+        return await interaction.followup.send(
+            "⚠️ I couldn't verify a current code list right now. Check the linked sources directly:\n"
+            "https://www.pockettactics.com/blox-fruits/codes\n"
+            "https://blox-fruits.fandom.com/wiki/Codes",
+            ephemeral=True,
+        )
+    embed = _suite_embed(
+        "🎟️ Blox Fruits • Codes",
+        "Community-sourced list. Codes can expire at any time — try them in-game. "
+        "This is **not** an official Roblox list.",
+    )
+    for name, value in _codes_field_chunks("Active / working", active, "✅"):
+        embed.add_field(name=name, value=value, inline=False)
+    for name, value in _codes_field_chunks("Expired / inactive", expired, "❌"):
+        embed.add_field(name=name, value=value, inline=False)
+    embed.add_field(name="Source", value=source or "Community code page", inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tasks.loop(hours=6)
 async def mega_codes_watcher():
-    """Post an updated code list when its source-derived snapshot changes."""
+    """Post an updated code list when active/expired snapshot changes."""
     channel_id = int(os.environ.get("CODES_CHANNEL_ID", "1504914665589706762") or 0)
     if not channel_id:
         return
     try:
-        await db.execute("CREATE TABLE IF NOT EXISTS df_codes_snapshot (id INTEGER PRIMARY KEY CHECK(id=1), codes TEXT NOT NULL, updated_at TEXT NOT NULL)")
-        codes, source = await fetch_current_blox_codes()
-        if not codes:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS df_codes_snapshot "
+            "(id INTEGER PRIMARY KEY CHECK(id=1), codes TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        active, expired, source = await fetch_current_blox_codes()
+        if not active and not expired:
             return
-        snapshot = json.dumps(codes, ensure_ascii=False)
+        snapshot = json.dumps({"active": active, "expired": expired}, ensure_ascii=False)
         old = await db.fetchone("SELECT codes FROM df_codes_snapshot WHERE id = 1")
         if old and old["codes"] == snapshot:
             return
-        await db.execute("INSERT INTO df_codes_snapshot (id,codes,updated_at) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET codes=excluded.codes,updated_at=excluded.updated_at", (snapshot, datetime.datetime.now(datetime.timezone.utc).isoformat()))
+        await db.execute(
+            "INSERT INTO df_codes_snapshot (id,codes,updated_at) VALUES (1,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET codes=excluded.codes,updated_at=excluded.updated_at",
+            (snapshot, datetime.datetime.now(datetime.timezone.utc).isoformat()),
+        )
         channel = bot.get_channel(channel_id)
         if not isinstance(channel, discord.TextChannel):
             return
-        embed = _suite_embed("🎟️ Blox Fruits • Code list updated", "Community-sourced code candidates. Codes can expire at any time; verify each in-game. No code is guaranteed active.")
-        embed.add_field(name=f"Codes found ({len(codes)})", value="\n".join(f"`{code}`" for code in codes[:30])[:1024], inline=False)
+        embed = _suite_embed(
+            "🎟️ Blox Fruits • Code list updated",
+            "Community-sourced codes. Verify each in-game — nothing here is guaranteed active.",
+        )
+        for name, value in _codes_field_chunks("Active / working", active, "✅"):
+            embed.add_field(name=name, value=value, inline=False)
+        for name, value in _codes_field_chunks("Expired / inactive", expired, "❌", limit=40):
+            embed.add_field(name=name, value=value, inline=False)
         embed.add_field(name="Source", value=source or "Community code page", inline=False)
         await channel.send(embed=embed)
     except Exception:
